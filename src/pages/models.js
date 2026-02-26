@@ -3,6 +3,7 @@
  */
 import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { showModal } from '../components/modal.js'
 
 export async function render() {
   const page = document.createElement('div')
@@ -109,11 +110,16 @@ function renderProviders(page, state) {
         state.config.models.providers[providerKey].models.splice(idx, 1)
         renderProviders(page, state)
       } else if (action === 'add-model') {
-        const id = prompt('输入模型 ID:')
-        if (id) {
-          state.config.models.providers[providerKey].models.push({ id })
-          renderProviders(page, state)
-        }
+        showModal({
+          title: '添加模型',
+          fields: [{ name: 'id', label: '模型 ID', placeholder: '如 claude-opus-4-6' }],
+          onConfirm: ({ id }) => {
+            if (id) {
+              state.config.models.providers[providerKey].models.push({ id })
+              renderProviders(page, state)
+            }
+          },
+        })
       }
     }
   })
@@ -128,13 +134,29 @@ function renderProviders(page, state) {
 }
 
 function addProvider(page, state) {
-  const key = prompt('输入 Provider 名称 (如 openai, newapi):')
-  if (!key) return
-  if (!state.config.models) state.config.models = { mode: 'replace', providers: {} }
-  if (!state.config.models.providers) state.config.models.providers = {}
-  state.config.models.providers[key] = { baseUrl: '', apiType: 'openai', models: [] }
-  renderProviders(page, state)
-  toast(`已添加 ${key}`, 'success')
+  showModal({
+    title: '添加 Provider',
+    fields: [
+      { name: 'key', label: 'Provider 名称', placeholder: '如 openai, newapi' },
+      { name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.openai.com/v1' },
+      {
+        name: 'apiType', label: 'API 类型', type: 'select',
+        options: [
+          { value: 'openai', label: 'OpenAI' },
+          { value: 'anthropic', label: 'Anthropic' },
+          { value: 'google', label: 'Google' },
+        ],
+      },
+    ],
+    onConfirm: ({ key, baseUrl, apiType }) => {
+      if (!key) return
+      if (!state.config.models) state.config.models = { mode: 'replace', providers: {} }
+      if (!state.config.models.providers) state.config.models.providers = {}
+      state.config.models.providers[key] = { baseUrl, apiType, models: [] }
+      renderProviders(page, state)
+      toast(`已添加 ${key}`, 'success')
+    },
+  })
 }
 
 async function saveConfig(state) {

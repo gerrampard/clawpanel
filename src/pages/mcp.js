@@ -3,6 +3,7 @@
  */
 import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
+import { showModal } from '../components/modal.js'
 
 export async function render() {
   const page = document.createElement('div')
@@ -122,12 +123,20 @@ function editServer(page, state, key) {
 }
 
 function addServer(page, state) {
-  const name = prompt('输入 MCP Server 名称:')
-  if (!name) return
-  const target = state.config?.mcpServers || state.config
-  target[name] = { command: '', args: [], env: {} }
-  renderServers(page, state)
-  toast(`已添加 ${name}`, 'success')
+  showModal({
+    title: '添加 MCP Server',
+    fields: [
+      { name: 'name', label: 'Server 名称', placeholder: '如 exa, web-reader' },
+      { name: 'command', label: '启动命令', placeholder: '如 npx, node' },
+    ],
+    onConfirm: ({ name, command }) => {
+      if (!name) return
+      const target = state.config?.mcpServers || state.config
+      target[name] = { command: command || '', args: [], env: {} }
+      renderServers(page, state)
+      toast(`已添加 ${name}`, 'success')
+    },
+  })
 }
 
 async function saveConfig(state) {

@@ -154,7 +154,7 @@
   margin-bottom: var(--space-lg);
 }
 
-.tab-item {
+.tab {
   padding: var(--space-sm) var(--space-lg);
   font-size: var(--font-size-sm);
   color: var(--text-tertiary);
@@ -163,8 +163,84 @@
   transition: all var(--transition-fast);
 }
 
-.tab-item:hover { color: var(--text-secondary); }
-.tab-item.active {
+.tab:hover { color: var(--text-secondary); }
+.tab.active {
   color: var(--accent-hover);
   border-bottom-color: var(--accent);
+}
+
+/* 配置操作栏 */
+.config-actions {
+  display: flex;
+  gap: var(--space-sm);
+  margin-bottom: var(--space-lg);
+}
+
+/* 按钮禁用状态 */
+.btn:disabled, .btn[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+
+/* 搜索高亮 */
+mark {
+  background: var(--warning-muted);
+  color: var(--warning);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+/* Loading 占位动画 */
+.loading-placeholder {
+  min-height: 80px;
+  background: linear-gradient(90deg, var(--bg-tertiary) 25%, var(--bg-glass-hover) 50%, var(--bg-tertiary) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+@keyframes shimmer {
+  0% { background-position: 200% 0; }
+  100% { background-position: -200% 0; }
+}
+
+/* Modal 弹窗 */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9000;
+  animation: fadeInModal 150ms ease;
+}
+
+.modal {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-xl);
+  padding: var(--space-xl);
+  min-width: 360px;
+  max-width: 500px;
+  box-shadow: var(--shadow-lg);
+}
+
+.modal-title {
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  margin-bottom: var(--space-lg);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-sm);
+  margin-top: var(--space-xl);
+}
+
+@keyframes fadeInModal {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }

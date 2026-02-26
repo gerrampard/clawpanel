@@ -30,13 +30,72 @@ function mockInvoke(cmd, args) {
     }),
     read_openclaw_config: () => ({
       meta: { lastTouchedVersion: '2026.2.23' },
-      models: { mode: 'replace', providers: {} },
-      agents: { defaults: { model: { primary: 'newapi-claude/claude-opus-4-6', fallbacks: [] } } },
-      gateway: { port: 18789, mode: 'local', bind: 'loopback' },
+      models: {
+        mode: 'replace',
+        providers: {
+          'newapi-claude': {
+            baseUrl: 'http://192.168.1.14:30080/v1',
+            apiType: 'openai',
+            models: [
+              { id: 'claude-opus-4-6' },
+              { id: 'claude-sonnet-4-5' },
+            ],
+          },
+        },
+      },
+      agents: {
+        defaults: {
+          model: { primary: 'newapi-claude/claude-opus-4-6', fallbacks: ['newapi-claude/claude-sonnet-4-5'] },
+          maxConcurrent: 4,
+          subagents: 2,
+        },
+      },
+      gateway: { port: 18789, mode: 'local', bind: 'loopback', authToken: '' },
     }),
-    read_log_tail: () => '2026-02-26 13:29:01 [INFO] Gateway started on :18789\n2026-02-26 13:29:02 [INFO] Agent connected\n',
-    list_memory_files: () => [],
-    read_mcp_config: () => ({}),
+    write_openclaw_config: () => true,
+    read_log_tail: ({ logName }) => {
+      const logs = {
+        'gateway': [
+          '2026-02-26 13:29:01 [INFO] Gateway started on :18789',
+          '2026-02-26 13:29:02 [INFO] Agent connected: claude-opus-4-6',
+          '2026-02-26 13:29:05 [INFO] Request /v1/chat/completions → 200 (1.2s)',
+          '2026-02-26 13:30:12 [INFO] Request /v1/chat/completions → 200 (3.8s)',
+          '2026-02-26 13:31:00 [WARN] Rate limit approaching: 45/50 rpm',
+          '2026-02-26 13:32:15 [INFO] Request /v1/chat/completions → 200 (2.1s)',
+        ],
+        'gateway-err': ['2026-02-26 12:00:01 [ERROR] Upstream 502: connection refused'],
+        'guardian': ['2026-02-26 13:29:00 [INFO] Health check passed', '2026-02-26 13:30:00 [INFO] Health check passed'],
+        'guardian-backup': ['2026-02-26 12:00:00 [INFO] Backup completed: openclaw.json.bak'],
+        'config-audit': ['{"ts":"2026-02-26T13:29:00Z","action":"config.read","file":"openclaw.json"}'],
+      }
+      return (logs[logName] || logs['gateway']).join('\n')
+    },
+    search_log: ({ query }) => [
+      `2026-02-26 13:29:01 [INFO] Match: ${query}`,
+      `2026-02-26 13:30:12 [INFO] Found: ${query} in request`,
+    ],
+    list_memory_files: ({ category }) => {
+      const files = {
+        memory: ['active-context.md', 'decisions.md', 'progress.md'],
+        archive: ['2026-02-sprint1.md', '2026-02-sprint2.md'],
+        core: ['AGENTS.md', 'CLAUDE.md'],
+      }
+      return files[category] || files.memory
+    },
+    read_memory_file: ({ path }) => `# ${path}\n\n这是 ${path} 的内容示例。\n\n## 概述\n\n在此记录工作记忆...`,
+    write_memory_file: () => true,
+    read_mcp_config: () => ({
+      mcpServers: {
+        'exa': { command: 'npx', args: ['-y', '@anthropic/exa-mcp-server'], env: { EXA_API_KEY: '***' } },
+        'web-reader': { command: 'npx', args: ['-y', '@anthropic/web-reader-mcp'], env: {} },
+        'pal': { command: 'node', args: ['/opt/pal-mcp/index.js'], env: {} },
+      },
+    }),
+    write_mcp_config: () => true,
+    start_service: () => true,
+    stop_service: () => true,
+    restart_service: () => true,
+    write_env_file: () => true,
   }
   const fn = mocks[cmd]
   return fn ? Promise.resolve(fn(args)) : Promise.reject(`未知命令: ${cmd}`)
