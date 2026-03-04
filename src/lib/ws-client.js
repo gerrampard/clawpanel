@@ -45,6 +45,7 @@ export class WsClient {
     this._pingTimer = null
     this._challengeTimer = null
     this._wsId = 0
+    this._autoPairAttempts = 0
   }
 
   get connected() { return this._connected }
@@ -65,6 +66,7 @@ export class WsClient {
 
   connect(host, token) {
     this._intentionalClose = false
+    this._autoPairAttempts = 0
     this._token = token || ''
     this._url = `ws://${host}/ws?token=${encodeURIComponent(this._token)}`
     this._doConnect()
@@ -86,6 +88,7 @@ export class WsClient {
     if (!this._url) return
     this._intentionalClose = false
     this._reconnectAttempts = 0
+    this._autoPairAttempts = 0
     this._stopPing()
     this._clearReconnectTimer()
     this._clearChallengeTimer()
@@ -136,10 +139,14 @@ export class WsClient {
         return
       }
       if (e.code === 1008 && !this._intentionalClose) {
-        // origin not allowed — 自动写入 allowedOrigins 后再重连
-        console.log('[ws] origin not allowed (1008)，尝试自动修复...')
-        this._setConnected(false, 'reconnecting', 'origin not allowed，修复中...')
-        this._autoPairAndReconnect()
+        if (this._autoPairAttempts < 1) {
+          console.log('[ws] origin not allowed (1008)，尝试自动修复...')
+          this._setConnected(false, 'reconnecting', 'origin not allowed，修复中...')
+          this._autoPairAndReconnect()
+          return
+        }
+        console.warn('[ws] origin 1008 自动修复已尝试过，显示错误')
+        this._setConnected(false, 'error', e.reason || 'origin not allowed，请点击「修复并重连」')
         return
       }
       this._setConnected(false)
@@ -172,11 +179,14 @@ export class WsClient {
         const errCode = msg.error?.code
         console.error('[ws] connect 失败:', errMsg, errCode)
 
-        // 如果是配对/origin 错误，尝试自动配对
+        // 如果是配对/origin 错误，尝试自动配对（仅一次，防止无限循环）
         if (errCode === 'NOT_PAIRED' || errCode === 'PAIRING_REQUIRED' || /origin not allowed/i.test(errMsg)) {
-          console.log('[ws] 检测到配对/origin 错误，尝试自动修复...', errCode || errMsg)
-          this._autoPairAndReconnect()
-          return
+          if (this._autoPairAttempts < 1) {
+            console.log('[ws] 检测到配对/origin 错误，尝试自动修复...', errCode || errMsg)
+            this._autoPairAndReconnect()
+            return
+          }
+          console.warn('[ws] 自动修复已尝试过，不再重试')
         }
 
         this._setConnected(false, 'error', errMsg)
@@ -211,8 +221,9 @@ export class WsClient {
   }
 
   async _autoPairAndReconnect() {
+    this._autoPairAttempts++
     try {
-      console.log('[ws] 检测到未配对，执行自动配对...')
+      console.log('[ws] 执行自动配对（第', this._autoPairAttempts, '次）...')
       const result = await api.autoPairDevice()
       console.log('[ws] 配对结果:', result)
 
@@ -251,6 +262,7 @@ export class WsClient {
   }
 
   _handleConnectSuccess(payload) {
+    this._autoPairAttempts = 0
     this._hello = payload || null
     this._snapshot = payload?.snapshot || null
     const defaults = this._snapshot?.sessionDefaults

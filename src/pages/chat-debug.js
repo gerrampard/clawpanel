@@ -463,9 +463,12 @@ function renderNetworkLog(contentEl) {
 async function fixPairing(page) {
   const logEl = page.querySelector('#ws-test-log')
   const contentEl = page.querySelector('#ws-log-content')
+  const fixBtn = page.querySelector('#btn-fix-pairing')
 
+  if (fixBtn) { fixBtn.disabled = true; fixBtn.textContent = '修复中...' }
   logEl.style.display = 'block'
   testLogs = []
+  logEl.scrollIntoView({ behavior: 'smooth', block: 'start' })
 
   function addLog(msg) {
     const timestamp = new Date().toLocaleTimeString('zh-CN', { hour12: false })
@@ -569,5 +572,7 @@ async function fixPairing(page) {
   } catch (e) {
     addLog(`❌ 修复失败: ${e}`)
     addLog('💡 建议：请手动前往"服务管理"页面重启 Gateway')
+  } finally {
+    if (fixBtn) { fixBtn.disabled = false; fixBtn.textContent = '一键修复配对' }
   }
 }
