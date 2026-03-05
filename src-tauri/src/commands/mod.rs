@@ -17,6 +17,7 @@ pub fn openclaw_dir() -> PathBuf {
 /// Tauri 应用启动时 PATH 可能不完整：
 /// - macOS 从 Finder 启动时 PATH 只有 /usr/bin:/bin:/usr/sbin:/sbin
 /// - Windows 上安装 Node.js 到非默认路径、或安装后未重启进程
+///
 /// 补充 Node.js / npm 常见安装路径
 pub fn enhanced_path() -> String {
     let current = std::env::var("PATH").unwrap_or_default();
@@ -71,14 +72,12 @@ pub fn enhanced_path() -> String {
     #[cfg(target_os = "windows")]
     {
         let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
-        let pf86 = std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        let pf86 =
+            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
         let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
         let appdata = std::env::var("APPDATA").unwrap_or_default();
 
-        let mut extra: Vec<String> = vec![
-            format!(r"{}\nodejs", pf),
-            format!(r"{}\nodejs", pf86),
-        ];
+        let mut extra: Vec<String> = vec![format!(r"{}\nodejs", pf), format!(r"{}\nodejs", pf86)];
         if !localappdata.is_empty() {
             extra.push(format!(r"{}\Programs\nodejs", localappdata));
             extra.push(format!(r"{}\fnm_multishells", localappdata));

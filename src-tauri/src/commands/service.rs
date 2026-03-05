@@ -206,6 +206,7 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
+    use std::os::windows::process::CommandExt;
     use tokio::process::Command as TokioCommand;
 
     /// Windows 不需要 UID

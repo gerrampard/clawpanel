@@ -514,10 +514,20 @@ pub async fn upgrade_openclaw(app: tauri::AppHandle, source: String) -> Result<S
     // 自动配置 git 使用 HTTPS 替代 SSH，避免用户没配 SSH Key 导致依赖安装失败
     let _ = app.emit("upgrade-log", "配置 Git HTTPS 模式...");
     let _ = Command::new("git")
-        .args(["config", "--global", "url.https://github.com/.insteadOf", "ssh://git@github.com/"])
+        .args([
+            "config",
+            "--global",
+            "url.https://github.com/.insteadOf",
+            "ssh://git@github.com/",
+        ])
         .output();
     let _ = Command::new("git")
-        .args(["config", "--global", "url.https://github.com/.insteadOf", "git@github.com:"])
+        .args([
+            "config",
+            "--global",
+            "url.https://github.com/.insteadOf",
+            "git@github.com:",
+        ])
         .output();
 
     let _ = app.emit("upgrade-log", format!("$ npm install -g {pkg}"));
@@ -658,8 +668,8 @@ pub fn init_openclaw_config() -> Result<Value, String> {
         "tools": { "profile": "full", "sessions": { "visibility": "all" } }
     });
 
-    let content = serde_json::to_string_pretty(&default_config)
-        .map_err(|e| format!("序列化失败: {e}"))?;
+    let content =
+        serde_json::to_string_pretty(&default_config).map_err(|e| format!("序列化失败: {e}"))?;
     std::fs::write(&config_path, content).map_err(|e| format!("写入失败: {e}"))?;
 
     result.insert("created".into(), Value::Bool(true));
@@ -749,8 +759,8 @@ pub fn scan_node_paths() -> Result<Value, String> {
     #[cfg(target_os = "windows")]
     {
         let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| r"C:\Program Files".into());
-        let pf86 = std::env::var("ProgramFiles(x86)")
-            .unwrap_or_else(|_| r"C:\Program Files (x86)".into());
+        let pf86 =
+            std::env::var("ProgramFiles(x86)").unwrap_or_else(|_| r"C:\Program Files (x86)".into());
         let localappdata = std::env::var("LOCALAPPDATA").unwrap_or_default();
         let appdata = std::env::var("APPDATA").unwrap_or_default();
 
