@@ -17,6 +17,7 @@ const BACKUPS_DIR = path.join(OPENCLAW_DIR, 'backups')
 const DEVICE_KEY_FILE = path.join(OPENCLAW_DIR, 'clawpanel-device-key.json')
 const DEVICES_DIR = path.join(OPENCLAW_DIR, 'devices')
 const PAIRED_PATH = path.join(DEVICES_DIR, 'paired.json')
+const isWindows = process.platform === 'win32'
 const isMac = process.platform === 'darwin'
 const SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write']
 
@@ -274,12 +275,20 @@ const handlers = {
   get_services_status() {
     const label = 'ai.openclaw.gateway'
     const { running, pid } = isMac ? macCheckService(label) : winCheckGateway()
-    const cliInstalled = isMac
-      ? fs.existsSync('/opt/homebrew/bin/openclaw') || fs.existsSync('/usr/local/bin/openclaw')
-      : (() => {
-          try { return fs.existsSync(path.join(process.env.APPDATA || '', 'npm', 'openclaw.cmd')) }
-          catch { return false }
-        })()
+
+    let cliInstalled = false
+    if (isMac) {
+      cliInstalled = fs.existsSync('/opt/homebrew/bin/openclaw') || fs.existsSync('/usr/local/bin/openclaw')
+    } else if (isWindows) {
+      try { cliInstalled = fs.existsSync(path.join(process.env.APPDATA || '', 'npm', 'openclaw.cmd')) }
+      catch { cliInstalled = false }
+    } else {
+      // Linux
+      cliInstalled = fs.existsSync('/usr/bin/openclaw') ||
+                     fs.existsSync('/usr/local/bin/openclaw') ||
+                     fs.existsSync(path.join(homedir(), '.openclaw/bin/openclaw'))
+    }
+
     return [{ label, running, pid, description: 'OpenClaw Gateway', cli_installed: cliInstalled }]
   },
 
@@ -564,7 +573,7 @@ const handlers = {
   upgrade_openclaw({ source = 'chinese' } = {}) {
     const OPENCLAW_DIR = path.join(homedir(), '.openclaw')
     const pkg = source === 'official' ? '@anthropic-ai/claw' : '@qingchencloud/openclaw-zh'
-    const npmBin = isMac ? 'npm' : 'npm.cmd'
+    const npmBin = isWindows ? 'npm.cmd' : 'npm'
     try {
       const out = execSync(`${npmBin} install ${pkg}@latest --prefix "${OPENCLAW_DIR}" 2>&1`, { timeout: 120000 }).toString()
       return `升级完成 (${source})\n${out.slice(-200)}`
