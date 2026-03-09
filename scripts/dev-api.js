@@ -7,12 +7,14 @@ import fs from 'fs'
 import path from 'path'
 import os from 'os'
 import { homedir, networkInterfaces } from 'os'
-import { execSync, spawn } from 'child_process'
+import { execSync, spawn, spawnSync } from 'child_process'
 import { fileURLToPath } from 'url'
 import net from 'net'
 import http from 'http'
 import crypto from 'crypto'
+import { DOCKER_TASK_TIMEOUT_MS } from '../src/lib/docker-tasking.js'
 
+const __dev_dirname = path.dirname(fileURLToPath(import.meta.url))
 const OPENCLAW_DIR = path.join(homedir(), '.openclaw')
 const CONFIG_PATH = path.join(OPENCLAW_DIR, 'openclaw.json')
 const MCP_CONFIG_PATH = path.join(OPENCLAW_DIR, 'mcp.json')
@@ -25,11 +27,41 @@ const isWindows = process.platform === 'win32'
 const isMac = process.platform === 'darwin'
 const isLinux = process.platform === 'linux'
 const SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write']
+const CLUSTER_TOKEN = 'clawpanel-cluster-secret-2026'
 const PANEL_CONFIG_PATH = path.join(OPENCLAW_DIR, 'clawpanel.json')
 const DOCKER_NODES_PATH = path.join(OPENCLAW_DIR, 'docker-nodes.json')
 const INSTANCES_PATH = path.join(OPENCLAW_DIR, 'instances.json')
 const DOCKER_SOCKET = process.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock'
 const OPENCLAW_IMAGE = 'ghcr.io/qingchencloud/openclaw'
+
+// === 异步任务存储 ===
+const _taskStore = new Map()   // taskId → task object
+const MAX_TASK_HISTORY = 50
+const _agentScriptSyncCache = new Map() // `${endpoint}:${containerId}` → 脚本 hash
+
+function createTask(containerId, containerName, nodeId, message) {
+  const id = `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+  const task = {
+    id,
+    containerId,
+    containerName: containerName || containerId.slice(0, 12),
+    nodeId: nodeId || null,
+    message,
+    status: 'running',   // running | completed | error
+    result: null,
+    error: null,
+    events: [],
+    startedAt: Date.now(),
+    completedAt: null,
+  }
+  _taskStore.set(id, task)
+  // 清理旧任务
+  if (_taskStore.size > MAX_TASK_HISTORY) {
+    const oldest = [..._taskStore.keys()].slice(0, _taskStore.size - MAX_TASK_HISTORY)
+    oldest.forEach(k => _taskStore.delete(k))
+  }
+  return task
+}
 
 // 语义化版本比较
 function versionGe(a, b) {
@@ -232,6 +264,93 @@ function getLocalIps() {
   return ips
 }
 
+// === Raw WebSocket（支持 Origin header，绕过 Gateway origin 检查）===
+function rawWsConnect(host, port, wsPath) {
+  return new Promise((ok, no) => {
+    const key = crypto.randomBytes(16).toString('base64')
+    const req = http.request({ hostname: host, port, path: wsPath, method: 'GET', headers: {
+      'Connection': 'Upgrade', 'Upgrade': 'websocket', 'Sec-WebSocket-Version': '13',
+      'Sec-WebSocket-Key': key, 'Origin': 'http://localhost',
+    } })
+    req.on('upgrade', (_, socket) => ok(socket))
+    req.on('response', (res) => { let d = ''; res.on('data', c => d += c); res.on('end', () => no(new Error(`HTTP ${res.statusCode}`))) })
+    req.on('error', no)
+    req.setTimeout(5000, () => { req.destroy(); no(new Error('ws connect timeout')) })
+    req.end()
+  })
+}
+function wsReadFrame(socket, timeout = 8000) {
+  return new Promise((ok, no) => {
+    let settled = false
+    const cleanup = () => {
+      clearTimeout(t)
+      socket.removeListener('data', onData)
+      socket.removeListener('error', onError)
+      socket.removeListener('close', onClose)
+    }
+    const finish = (fn) => (value) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      fn(value)
+    }
+    const t = setTimeout(finish(no), timeout, new Error('ws read timeout'))
+    let buf = Buffer.alloc(0)
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]); if (buf.length < 2) return
+      let len = buf[1] & 0x7f, off = 2
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4 }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10 }
+      if (buf.length < off + len) return
+      finish(ok)(buf.slice(off, off + len).toString('utf8'))
+    }
+    const onError = finish(no)
+    const onClose = finish(no)
+    socket.on('data', onData)
+    socket.on('error', onError)
+    socket.on('close', () => onClose(new Error('ws closed')))
+  })
+}
+function wsSendFrame(socket, text) {
+  const p = Buffer.from(text, 'utf8'), mask = crypto.randomBytes(4)
+  let h
+  if (p.length < 126) { h = Buffer.alloc(2); h[0] = 0x81; h[1] = 0x80 | p.length }
+  else { h = Buffer.alloc(4); h[0] = 0x81; h[1] = 0x80 | 126; h.writeUInt16BE(p.length, 2) }
+  const m = Buffer.alloc(p.length); for (let i = 0; i < p.length; i++) m[i] = p[i] ^ mask[i % 4]
+  socket.write(Buffer.concat([h, mask, m]))
+}
+// 持续读取 WS 帧，每条消息调用 onMessage，支持超时和取消
+function wsReadLoop(socket, onMessage, timeoutMs = DOCKER_TASK_TIMEOUT_MS) {
+  let buf = Buffer.alloc(0), done = false
+  const timer = setTimeout(() => { done = true; socket.destroy() }, timeoutMs)
+  const cancel = () => { done = true; clearTimeout(timer); try { socket.destroy() } catch {} }
+  socket.on('data', (chunk) => {
+    if (done) return
+    buf = Buffer.concat([buf, chunk])
+    while (buf.length >= 2) {
+      const opcode = buf[0] & 0x0f
+      let len = buf[1] & 0x7f, off = 2
+      if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4 }
+      else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10 }
+      if (buf.length < off + len) return
+      const payload = buf.slice(off, off + len)
+      buf = buf.slice(off + len)
+      if (opcode === 0x08) { done = true; clearTimeout(timer); socket.destroy(); return } // close
+      if (opcode === 0x09) { // ping → 回 pong
+        const mask = crypto.randomBytes(4)
+        const h = Buffer.alloc(2); h[0] = 0x8A; h[1] = 0x80 | payload.length
+        const m = Buffer.alloc(payload.length); for (let i = 0; i < payload.length; i++) m[i] = payload[i] ^ mask[i % 4]
+        try { socket.write(Buffer.concat([h, mask, m])) } catch {}
+        continue
+      }
+      if (opcode === 0x01) onMessage(payload.toString('utf8')) // text
+    }
+  })
+  socket.on('error', () => { done = true; clearTimeout(timer) })
+  socket.on('close', () => { done = true; clearTimeout(timer) })
+  return cancel
+}
+
 function patchGatewayOrigins() {
   if (!fs.existsSync(CONFIG_PATH)) return false
   const config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
@@ -320,7 +439,67 @@ function macRestartService(label) {
 
 // === Windows 服务管理 ===
 
+function parseWindowsListeningPids(output, port) {
+  const portSuffix = `:${port}`
+  const pids = new Set()
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.trim()
+    if (!line) continue
+    if (!line.includes('LISTENING') && !line.includes('侦听')) continue
+    const parts = line.split(/\s+/)
+    if (parts.length < 5) continue
+    if (!parts[1]?.endsWith(portSuffix)) continue
+    const pid = Number.parseInt(parts[4], 10)
+    if (Number.isInteger(pid) && pid > 0) pids.add(pid)
+  }
+  return [...pids].sort((a, b) => a - b)
+}
+
+function looksLikeGatewayCommandLine(commandLine) {
+  const text = String(commandLine || '').toLowerCase()
+  return text.includes('openclaw') && text.includes('gateway')
+}
+
+function readWindowsProcessCommandLine(pid) {
+  const script = `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($p) { [Console]::Out.Write($p.CommandLine) }`
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-Command', script], {
+    windowsHide: true,
+    encoding: 'utf8',
+  })
+  if (result.status !== 0) return ''
+  return String(result.stdout || '').trim()
+}
+
+function inspectWindowsPortOwners(port = readGatewayPort()) {
+  const output = execSync('netstat -ano', { windowsHide: true }).toString()
+  const listeningPids = parseWindowsListeningPids(output, port)
+  const gatewayPids = []
+  const foreignPids = []
+
+  for (const pid of listeningPids) {
+    const commandLine = readWindowsProcessCommandLine(pid)
+    if (looksLikeGatewayCommandLine(commandLine)) gatewayPids.push(pid)
+    else foreignPids.push(pid)
+  }
+
+  return {
+    gatewayPids: [...new Set(gatewayPids)].sort((a, b) => a - b),
+    foreignPids: [...new Set(foreignPids)].sort((a, b) => a - b),
+  }
+}
+
+function formatPidList(pids) {
+  return pids.map(String).join(', ')
+}
+
 function winStartGateway() {
+  const port = readGatewayPort()
+  const { gatewayPids, foreignPids } = inspectWindowsPortOwners(port)
+  if (gatewayPids.length) return
+  if (foreignPids.length) {
+    throw new Error(`端口 ${port} 已被非 Gateway 进程占用 (PID: ${formatPidList(foreignPids)})，已阻止启动`)
+  }
+
   // 确保日志目录存在
   if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true })
   const logPath = path.join(LOGS_DIR, 'gateway.log')
@@ -343,39 +522,48 @@ function winStartGateway() {
 }
 
 async function winStopGateway() {
-  const { running } = await winCheckGateway()
-  if (!running) throw new Error('Gateway 未运行')
-  try {
-    execSync('taskkill /F /IM node.exe /FI "WINDOWTITLE eq openclaw*"', { timeout: 5000, windowsHide: true })
-  } catch {
-    try {
-      execSync('taskkill /F /IM node.exe', { timeout: 5000, windowsHide: true })
-    } catch (e) {
-      throw new Error('停止失败: ' + (e.message || e))
+  const port = readGatewayPort()
+  const { gatewayPids, foreignPids } = inspectWindowsPortOwners(port)
+  if (!gatewayPids.length) {
+    if (foreignPids.length) {
+      throw new Error(`端口 ${port} 当前由非 Gateway 进程占用 (PID: ${formatPidList(foreignPids)})，已拒绝停止以避免误杀`)
     }
+    return
   }
+
+  spawnSync('cmd.exe', ['/c', 'openclaw', 'gateway', 'stop'], {
+    windowsHide: true,
+    cwd: homedir(),
+    encoding: 'utf8',
+  })
+
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 300))
+    if (!(await winCheckGateway()).running) return
+  }
+
+  for (const pid of gatewayPids) {
+    try {
+      execSync(`taskkill /F /T /PID ${pid}`, { timeout: 5000, windowsHide: true })
+    } catch {}
+  }
+
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, 300))
+    if (!(await winCheckGateway()).running) return
+  }
+
+  throw new Error(`停止失败：Gateway 仍占用端口 ${port}`)
 }
 
-// TCP 探测 Gateway 端口（纯异步，零子进程，不会闪终端）
-function winCheckGateway() {
+// 仅当占用端口的确实是 OpenClaw Gateway 时才视为运行
+async function winCheckGateway() {
   const port = readGatewayPort()
-  return new Promise(resolve => {
-    const sock = new net.Socket()
-    sock.setTimeout(300)
-    sock.once('connect', () => {
-      sock.destroy()
-      resolve({ running: true, pid: null })
-    })
-    sock.once('error', () => {
-      sock.destroy()
-      resolve({ running: false, pid: null })
-    })
-    sock.once('timeout', () => {
-      sock.destroy()
-      resolve({ running: false, pid: null })
-    })
-    sock.connect(port, '127.0.0.1')
-  })
+  const { gatewayPids } = inspectWindowsPortOwners(port)
+  return {
+    running: gatewayPids.length > 0,
+    pid: gatewayPids[0] || null,
+  }
 }
 
 function readGatewayPort() {
@@ -534,6 +722,130 @@ function dockerRequest(method, apiPath, body = null, endpoint = null) {
   })
 }
 
+// Docker exec 附着模式：运行命令并捕获 stdout/stderr（解析多路复用流）
+function dockerExecRun(containerId, cmd, endpoint = null, timeout = DOCKER_TASK_TIMEOUT_MS) {
+  return new Promise(async (resolve, reject) => {
+    try {
+      // 1. 创建 exec
+      const createResp = await dockerRequest('POST', `/containers/${containerId}/exec`, {
+        AttachStdout: true, AttachStderr: true, Cmd: cmd,
+      }, endpoint)
+      if (createResp.status >= 400) return reject(new Error(`exec create: ${createResp.status} ${createResp.data?.message || ''}`))
+      const execId = createResp.data?.Id
+      if (!execId) return reject(new Error('no exec ID'))
+
+      // 2. 启动 exec（附着模式，捕获输出流）
+      const opts = {
+        path: `/exec/${execId}/start`, method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      }
+      if (endpoint && endpoint.startsWith('tcp://')) {
+        const url = new URL(endpoint.replace('tcp://', 'http://'))
+        opts.hostname = url.hostname
+        opts.port = parseInt(url.port) || 2375
+      } else {
+        opts.socketPath = endpoint || DOCKER_SOCKET
+      }
+
+      const req = http.request(opts, (res) => {
+        let stdout = '', stderr = ''
+        let buf = Buffer.alloc(0)
+
+        res.on('data', (chunk) => {
+          buf = Buffer.concat([buf, chunk])
+          // 解析 Docker 多路复用流：[type(1), 0(3), size(4)] + payload
+          while (buf.length >= 8) {
+            const streamType = buf[0] // 1=stdout, 2=stderr
+            const size = buf.readUInt32BE(4)
+            if (buf.length < 8 + size) break
+            const payload = buf.slice(8, 8 + size).toString('utf8')
+            buf = buf.slice(8 + size)
+            if (streamType === 1) stdout += payload
+            else if (streamType === 2) stderr += payload
+          }
+        })
+
+        res.on('end', () => resolve({ stdout, stderr }))
+        res.on('error', reject)
+      })
+
+      req.on('error', reject)
+      req.setTimeout(timeout, () => { req.destroy(); reject(new Error('exec timeout')) })
+      req.write(JSON.stringify({ Detach: false, Tty: false }))
+      req.end()
+    } catch (e) { reject(e) }
+  })
+}
+
+// 查找 clawpanel-agent.cjs 脚本并注入到容器（.cjs 避免容器内 ESM 冲突）
+function findAgentScript() {
+  const candidates = [
+    path.resolve(__dev_dirname, '../openclaw-docker/full/clawpanel-agent.cjs'),
+    path.resolve(__dev_dirname, '../openclaw-docker/full/clawpanel-agent.js'),
+    path.resolve(__dev_dirname, '../../openclaw-docker/full/clawpanel-agent.cjs'),
+    path.resolve(__dev_dirname, '../../openclaw-docker/full/clawpanel-agent.js'),
+    path.resolve(__dev_dirname, '../clawpanel-agent.cjs'),
+    path.resolve(__dev_dirname, '../clawpanel-agent.js'),
+    path.resolve(__dev_dirname, 'clawpanel-agent.cjs'),
+    path.resolve(__dev_dirname, 'clawpanel-agent.js'),
+  ]
+  for (const p of candidates) {
+    if (!fs.existsSync(p)) continue
+    const content = fs.readFileSync(p, 'utf8')
+    return {
+      path: p,
+      content,
+      hash: crypto.createHash('sha256').update(content).digest('hex'),
+    }
+  }
+  return null
+}
+
+function getAgentSyncCacheKey(containerId, endpoint) {
+  return `${endpoint || DOCKER_SOCKET}:${containerId}`
+}
+
+function createContainerShellExec(containerId, endpoint) {
+  return async (shellCmd) => {
+    const createResp = await dockerRequest('POST', `/containers/${containerId}/exec`, {
+      AttachStdout: true, AttachStderr: true, Cmd: ['sh', '-c', shellCmd],
+    }, endpoint)
+    if (createResp.status >= 400) throw new Error(`exec 失败: ${createResp.status}`)
+    const execId = createResp.data?.Id
+    if (!execId) throw new Error('exec ID 缺失')
+    await dockerRequest('POST', `/exec/${execId}/start`, { Detach: true }, endpoint)
+    await new Promise(r => setTimeout(r, 300))
+  }
+}
+
+async function injectAgentToContainer(containerId, endpoint, cExecFn, agentScript = null) {
+  const source = agentScript || findAgentScript()
+  if (!source) {
+    console.warn('[agent] clawpanel-agent.cjs 未找到，跳过注入')
+    return false
+  }
+  const b64 = Buffer.from(source.content, 'utf8').toString('base64')
+  await cExecFn(`echo '${b64}' | base64 -d > /app/clawpanel-agent.cjs`)
+  console.log(`[agent] agent 已同步 → ${containerId.slice(0, 12)} (${source.hash.slice(0, 8)})`)
+  _agentScriptSyncCache.set(getAgentSyncCacheKey(containerId, endpoint), source.hash)
+  return true
+}
+
+async function syncAgentToContainerIfNeeded(containerId, endpoint, cExecFn) {
+  const source = findAgentScript()
+  if (!source) {
+    console.warn('[agent] 本地 agent 脚本缺失，跳过自动同步')
+    return false
+  }
+
+  const cacheKey = getAgentSyncCacheKey(containerId, endpoint)
+  if (_agentScriptSyncCache.get(cacheKey) === source.hash) {
+    return true
+  }
+
+  return injectAgentToContainer(containerId, endpoint, cExecFn, source)
+}
+
 function readDockerNodes() {
   if (!fs.existsSync(DOCKER_NODES_PATH)) {
     return [{ id: 'local', name: '本机', type: 'socket', endpoint: DOCKER_SOCKET }]
@@ -667,7 +979,7 @@ const ALWAYS_LOCAL = new Set([
   'instance_health_check', 'instance_health_all',
   'docker_info', 'docker_list_containers', 'docker_create_container',
   'docker_start_container', 'docker_stop_container', 'docker_restart_container',
-  'docker_remove_container', 'docker_container_logs', 'docker_container_exec', 'docker_init_worker', 'docker_gateway_chat', 'docker_pull_image', 'docker_pull_status',
+  'docker_remove_container', 'docker_rebuild_container', 'docker_container_logs', 'docker_container_exec', 'docker_init_worker', 'docker_gateway_chat', 'docker_agent', 'docker_agent_broadcast', 'docker_dispatch_task', 'docker_dispatch_broadcast', 'docker_task_status', 'docker_task_list', 'docker_pull_image', 'docker_pull_status',
   'docker_list_images', 'docker_list_nodes', 'docker_add_node', 'docker_remove_node',
   'docker_cluster_overview',
   'auth_check', 'auth_login', 'auth_logout',
@@ -751,7 +1063,7 @@ const handlers = {
       linuxStartGateway()
       return true
     }
-    try { await winStopGateway() } catch {}
+    await winStopGateway()
     for (let i = 0; i < 10; i++) {
       const { running } = await winCheckGateway()
       if (!running) break
@@ -1005,7 +1317,111 @@ const handlers = {
     return true
   },
 
-  async docker_gateway_chat({ nodeId, containerId, message, timeout = 120000 } = {}) {
+  // 重建容器（保留配置，拉取最新镜像重新创建）
+  async docker_rebuild_container({ nodeId, containerId, pullLatest = true } = {}) {
+    if (!containerId) throw new Error('缺少 containerId')
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+
+    // 1. 检查容器详情
+    const inspectResp = await dockerRequest('GET', `/containers/${containerId}/json`, null, node.endpoint)
+    if (inspectResp.status >= 400) throw new Error('容器不存在或无法访问')
+    const info = inspectResp.data
+    const oldName = (info.Name || '').replace(/^\//, '')
+    const oldImage = info.Config?.Image || ''
+    const oldEnv = info.Config?.Env || []
+    const oldPortBindings = info.HostConfig?.PortBindings || {}
+    const oldBinds = info.HostConfig?.Binds || []
+    const oldRestartPolicy = info.HostConfig?.RestartPolicy || { Name: 'unless-stopped' }
+    const oldExposedPorts = info.Config?.ExposedPorts || {}
+
+    // 从名字推断角色
+    const role = (() => {
+      const n = oldName.toLowerCase()
+      for (const r of ['coder', 'translator', 'writer', 'analyst', 'custom']) {
+        if (n.includes(r)) return r
+      }
+      return 'general'
+    })()
+
+    console.log(`[rebuild] ${oldName} (${containerId.slice(0, 12)}) — image: ${oldImage}`)
+
+    // 2. 拉取最新镜像（可选）
+    if (pullLatest && oldImage) {
+      const [img, tag] = oldImage.includes(':') ? oldImage.split(':') : [oldImage, 'latest']
+      try {
+        const pullResp = await dockerRequest('POST', `/images/create?fromImage=${encodeURIComponent(img)}&tag=${encodeURIComponent(tag)}`, null, node.endpoint)
+        if (pullResp.status < 300) console.log(`[rebuild] 镜像已更新: ${oldImage}`)
+      } catch (e) {
+        console.warn(`[rebuild] 镜像拉取失败(继续使用本地): ${e.message}`)
+      }
+    }
+
+    // 3. 停止并移除旧容器
+    await dockerRequest('POST', `/containers/${containerId}/stop`, null, node.endpoint).catch(() => {})
+    await new Promise(r => setTimeout(r, 1000))
+    const rmResp = await dockerRequest('DELETE', `/containers/${containerId}?force=true`, null, node.endpoint)
+    if (rmResp.status !== 204 && rmResp.status !== 404) {
+      throw new Error(`移除旧容器失败: ${rmResp.data?.message || rmResp.status}`)
+    }
+
+    // 移除旧实例注册
+    const instData = readInstances()
+    const instId = `docker-${containerId.slice(0, 12)}`
+    instData.instances = instData.instances.filter(i => i.id !== instId && i.containerId !== containerId)
+    saveInstances(instData)
+
+    // 4. 创建新容器（相同配置）
+    const newConfig = {
+      Image: oldImage,
+      Env: oldEnv,
+      ExposedPorts: oldExposedPorts,
+      HostConfig: {
+        PortBindings: oldPortBindings,
+        RestartPolicy: oldRestartPolicy,
+        Binds: oldBinds,
+      },
+    }
+    const query = `?name=${encodeURIComponent(oldName)}`
+    const createResp = await dockerRequest('POST', `/containers/create${query}`, newConfig, node.endpoint)
+    if (createResp.status !== 201) throw new Error(`创建新容器失败: ${createResp.data?.message || createResp.status}`)
+    const newId = createResp.data?.Id
+
+    // 5. 启动新容器
+    const startResp = await dockerRequest('POST', `/containers/${newId}/start`, null, node.endpoint)
+    if (startResp.status !== 204 && startResp.status !== 304) throw new Error('新容器启动失败')
+
+    const newCid = newId?.slice(0, 12) || newId
+
+    // 6. 注册实例
+    const panelPort = oldPortBindings['1420/tcp']?.[0]?.HostPort
+    if (panelPort) {
+      const endpoint = `http://127.0.0.1:${panelPort}`
+      if (!instData.instances.find(i => i.endpoint === endpoint)) {
+        instData.instances.push({
+          id: `docker-${newCid}`, name: oldName, type: 'docker',
+          endpoint, gatewayPort: oldPortBindings['18789/tcp']?.[0]?.HostPort || 18789,
+          containerId: newCid, nodeId: node.id,
+          addedAt: Math.floor(Date.now() / 1000), note: `Rebuilt: ${oldImage}`,
+        })
+        saveInstances(instData)
+      }
+    }
+
+    // 7. 初始化（同步配置 + 注入 agent）
+    await new Promise(r => setTimeout(r, 3000))
+    try {
+      await handlers.docker_init_worker({ nodeId, containerId: newId, role })
+    } catch (e) {
+      console.warn(`[rebuild] 初始化警告: ${e.message}`)
+    }
+
+    console.log(`[rebuild] ${oldName} 重建完成: ${containerId.slice(0, 12)} → ${newCid}`)
+    return { id: newCid, name: oldName, rebuilt: true, role }
+  },
+
+  async docker_gateway_chat({ nodeId, containerId, message, timeout = DOCKER_TASK_TIMEOUT_MS } = {}) {
     if (!containerId || !message) throw new Error('缺少 containerId 或 message')
     // 1. 查找容器的 Gateway 端口
     const nodes = readDockerNodes()
@@ -1042,102 +1458,58 @@ const handlers = {
       }
     }
 
-    // 2b. 从容器配置中读取 Gateway auth token（Gateway 启动时自动生成）
-    let gatewayToken = ''
-    try {
-      const tokenExec = await dockerRequest('POST', `/containers/${containerId}/exec`, {
-        AttachStdout: true, AttachStderr: true,
-        Cmd: ['sh', '-c', 'node -e "const c=JSON.parse(require(\'fs\').readFileSync(\'/root/.openclaw/openclaw.json\',\'utf8\'));process.stdout.write(c.gateway?.auth?.token||\'\')"']
-      }, node.endpoint)
-      const tokenExecId = tokenExec.data?.Id
-      if (tokenExecId) {
-        const tokenResp = await new Promise((ok, no) => {
-          const opts = { path: `/exec/${tokenExecId}/start`, method: 'POST', headers: { 'Content-Type': 'application/json' } }
-          if (node.endpoint && node.endpoint.startsWith('tcp://')) {
-            const url = new URL(node.endpoint.replace('tcp://', 'http://'))
-            opts.hostname = url.hostname
-            opts.port = parseInt(url.port) || 2375
-          } else {
-            opts.socketPath = node.endpoint || DOCKER_SOCKET
-          }
-          const req = http.request(opts, res => {
-            let d = ''
-            res.on('data', c => d += c.toString().replace(/[\x00-\x08]/g, ''))
-            res.on('end', () => ok(d.trim()))
-          })
-          req.on('error', () => ok(''))
-          req.write(JSON.stringify({ Detach: false, Tty: false }))
-          req.end()
-        })
-        gatewayToken = tokenResp.replace(/[^a-zA-Z0-9_\-\.]/g, '')
-        if (gatewayToken) console.log(`[gateway-chat] 读取到 auth token: ${gatewayToken.slice(0, 8)}...`)
+    // 3. Raw WebSocket 连接 Gateway（带 Origin header + 固定 CLUSTER_TOKEN，含重试）
+    let socket
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        socket = await rawWsConnect('127.0.0.1', parseInt(gwPort), '/ws')
+        break
+      } catch (e) {
+        if (attempt === 3) throw new Error(`${containerName}: WebSocket 连接失败 — ${e.message}`)
+        console.log(`[gateway-chat] ${containerName}: WS 连接失败(${attempt}/3)，${attempt * 2}s 后重试...`)
+        await new Promise(r => setTimeout(r, attempt * 2000))
       }
-    } catch (e) {
-      console.warn(`[gateway-chat] 读取 auth token 失败: ${e.message}`)
     }
+    console.log(`[gateway-chat] WebSocket 已连接 ws://127.0.0.1:${gwPort}/ws`)
 
-    // 3. 通过 WebSocket 连接 Gateway（Node 22 内置 WebSocket）
+    // 3a. 读取 connect.challenge
+    const challengeRaw = await wsReadFrame(socket, 8000)
+    const challenge = JSON.parse(challengeRaw)
+    if (challenge.event !== 'connect.challenge') throw new Error('Gateway 未发送 challenge')
+
+    // 3b. 发送 connect 帧（固定 token + 完整设备签名）
+    const connectFrame = handlers.create_connect_frame({ nonce: challenge.payload?.nonce || '', gatewayToken: CLUSTER_TOKEN })
+    wsSendFrame(socket, JSON.stringify(connectFrame))
+
+    // 3c. 读取 connect 响应
+    const connectRespRaw = await wsReadFrame(socket, 8000)
+    const connectResp = JSON.parse(connectRespRaw)
+    if (!connectResp.ok) {
+      socket.destroy()
+      const errMsg = connectResp.error?.message || 'Gateway 握手失败'
+      throw new Error(`${containerName}: ${errMsg}`)
+    }
+    console.log(`[gateway-chat] 握手成功: ${containerName}`)
+    const defaults = connectResp.payload?.snapshot?.sessionDefaults
+    const sessionKey = defaults?.mainSessionKey || `agent:${defaults?.defaultAgentId || 'main'}:cluster-task`
+
+    // 4. 发送聊天消息
+    const chatId = `chat-${Date.now().toString(36)}`
+    wsSendFrame(socket, JSON.stringify({
+      type: 'req', id: chatId, method: 'chat.send',
+      params: { sessionKey, message, deliver: false, idempotencyKey: chatId }
+    }))
+
+    // 5. 读取聊天回复流
+    console.log(`[gateway-chat] 消息已发送，等待 AI 回复: ${containerName}`)
     return new Promise((resolve, reject) => {
-      const wsUrl = `ws://127.0.0.1:${gwPort}/ws`
-      let ws
-      try { ws = new WebSocket(wsUrl) } catch (e) { return reject(new Error(`无法创建 WebSocket: ${e.message}`)) }
-      let result = '', handshakeOk = false, sessionKey = 'agent:main:cluster-task', done = false
-      const timer = setTimeout(() => { if (!done) { done = true; ws.close(); reject(new Error('Gateway 通信超时(120s)')) } }, timeout)
-      // 如果 3s 内没收到 challenge，主动发 connect
-      const challengeTimer = setTimeout(() => { if (!handshakeOk) doConnect('') }, 3000)
-
-      function doConnect(nonce) {
-        try {
-          const frame = handlers.create_connect_frame({ nonce, gatewayToken })
-          ws.send(JSON.stringify(frame))
-        } catch {
-          ws.send(JSON.stringify({ type: 'req', id: 'connect-1', method: 'connect', params: {} }))
-        }
-      }
-
-      function sendChat() {
-        const id = `chat-${Date.now().toString(36)}`
-        ws.send(JSON.stringify({
-          type: 'req', id, method: 'chat.send',
-          params: { sessionKey, message, deliver: false, idempotencyKey: id }
-        }))
-      }
-
-      ws.addEventListener('open', () => {
-        console.log(`[gateway-chat] WebSocket 已连接 ${wsUrl}`)
-      })
-
-      ws.addEventListener('message', (evt) => {
+      let result = '', done = false
+      const cancel = wsReadLoop(socket, (data) => {
         let msg
-        try { msg = JSON.parse(typeof evt.data === 'string' ? evt.data : evt.data.toString()) } catch { return }
-
-        // connect.challenge
-        if (msg.type === 'event' && msg.event === 'connect.challenge') {
-          clearTimeout(challengeTimer)
-          doConnect(msg.payload?.nonce || '')
-          return
-        }
-        // connect 响应
-        if (msg.type === 'res' && msg.id?.startsWith('connect')) {
-          clearTimeout(challengeTimer)
-          if (msg.ok) {
-            handshakeOk = true
-            console.log(`[gateway-chat] 握手成功: ${containerName}`)
-            const defaults = msg.payload?.snapshot?.sessionDefaults
-            if (defaults?.mainSessionKey) sessionKey = defaults.mainSessionKey
-            else sessionKey = `agent:${defaults?.defaultAgentId || 'main'}:cluster-task`
-            sendChat()
-          } else {
-            done = true; clearTimeout(timer); ws.close()
-            const errMsg = msg.error?.message || ''
-            if (errMsg.includes('origin not allowed') || errMsg.includes('not paired'))
-              reject(new Error(`Gateway 需要设备配对 — 请先在容器 ${containerName} 的面板中完成配对`))
-            else
-              reject(new Error(errMsg || 'Gateway 握手失败'))
-          }
-          return
-        }
-        // chat 事件流
+        try { msg = JSON.parse(data) } catch { return }
+        // 诊断日志：显示所有收到的消息类型
+        const msgInfo = msg.type === 'event' ? `event:${msg.event} state=${msg.payload?.state || ''}` : `${msg.type} id=${msg.id} ok=${msg.ok}`
+        console.log(`[gateway-chat] ${containerName} ← ${msgInfo}`)
         if (msg.type === 'event' && msg.event === 'chat') {
           const p = msg.payload
           if (p?.state === 'delta') {
@@ -1147,40 +1519,220 @@ const handlers = {
           if (p?.state === 'final') {
             const content = p.message?.content
             if (typeof content === 'string' && content) result = content
-            done = true; clearTimeout(timer); ws.close()
+            done = true; cancel()
             resolve({ ok: true, result })
           }
-          return
-        }
-        // chat.send 响应
-        if (msg.type === 'res' && !msg.id?.startsWith('connect')) {
-          if (!msg.ok) {
-            done = true; clearTimeout(timer); ws.close()
-            const errMsg = msg.error?.message || '任务发送失败'
-            if (errMsg.includes('no model') || errMsg.includes('model'))
-              reject(new Error(`${containerName}: 未配置模型 — 请先在容器面板中配置 AI 模型`))
-            else
-              reject(new Error(errMsg))
+          if (p?.state === 'error') {
+            done = true; cancel()
+            const errDetail = p.error?.message || p.message?.content || p.errorMessage || JSON.stringify(p).slice(0, 300)
+            console.error(`[gateway-chat] ${containerName} AI error payload:`, JSON.stringify(p).slice(0, 500))
+            reject(new Error(`${containerName}: AI 错误 — ${errDetail}`))
           }
         }
+        if (msg.type === 'res' && !msg.ok) {
+          done = true; cancel()
+          const errMsg = msg.error?.message || '任务发送失败'
+          if (errMsg.includes('no model') || errMsg.includes('model'))
+            reject(new Error(`${containerName}: 未配置模型 — 请先在容器面板中配置 AI 模型`))
+          else
+            reject(new Error(`${containerName}: ${errMsg}`))
+        }
+      }, timeout)
+      // 超时兜底
+      setTimeout(() => {
+        if (!done) { done = true; cancel(); resolve({ ok: true, result: result || '（无回复）' }) }
+      }, timeout)
+    })
+  },
+
+  // === Docker Agent 通道（容器内专属控制代理）===
+  async docker_agent({ nodeId, containerId, cmd } = {}) {
+    if (!containerId) throw new Error('缺少 containerId')
+    if (!cmd || !cmd.cmd) throw new Error('缺少 cmd')
+    const nodes = readDockerNodes()
+    const node = nodeId ? nodes.find(n => n.id === nodeId) : nodes[0]
+    if (!node) throw new Error('节点不存在')
+
+    const cmdJson = JSON.stringify(cmd)
+    const timeout = cmd.timeout || (cmd.cmd === 'task.run' ? DOCKER_TASK_TIMEOUT_MS : 30000)
+    const cid12 = containerId.slice(0, 12)
+
+    const runAgent = async () => {
+      const execResult = await dockerExecRun(
+        containerId,
+        ['node', '/app/clawpanel-agent.cjs', cmdJson],
+        node.endpoint,
+        timeout,
+      )
+      return execResult
+    }
+
+    const cExec = createContainerShellExec(containerId, node.endpoint)
+
+    console.log(`[agent] ${cid12} → ${cmd.cmd}`)
+    let execResult
+    try {
+      await syncAgentToContainerIfNeeded(containerId, node.endpoint, cExec)
+      execResult = await runAgent()
+    } catch (e) {
+      // exec 本身失败（如 node 未找到模块），尝试自动注入
+      throw new Error(`容器代理执行失败: ${e.message}`)
+    }
+
+    // 检查 agent 是否缺失（stdout 空 + stderr 含 "Cannot find module"）
+    if (!execResult.stdout.trim() && execResult.stderr.includes('Cannot find module')) {
+      console.log(`[agent] ${cid12}: agent 未安装，自动注入中...`)
+      const injected = await injectAgentToContainer(containerId, node.endpoint, cExec)
+      if (!injected) throw new Error('容器代理未安装且无法自动注入 — 请先执行征召(init-worker)')
+      execResult = await runAgent()
+    }
+
+    // 解析 NDJSON 输出
+    const lines = execResult.stdout.split('\n').filter(l => l.trim())
+    const events = []
+    for (const line of lines) {
+      try { events.push(JSON.parse(line)) } catch {}
+    }
+
+    if (execResult.stderr) {
+      console.warn(`[agent] ${cid12} stderr: ${execResult.stderr.slice(0, 300)}`)
+    }
+
+    // 提取最终结果
+    const error = events.find(e => e.type === 'error')
+    if (error) {
+      const err = new Error(error.message || '容器代理执行失败')
+      err.events = events
+      throw err
+    }
+
+    const final = events.find(e => e.type === 'final')
+    const result = events.find(e => e.type === 'result')
+
+    if (final) return { ok: true, result: final.text, events }
+    if (result) {
+      if (result.ok) return { ok: true, ...result, events }
+      const err = new Error(result.message || '容器代理执行失败')
+      err.events = events
+      throw err
+    }
+
+    const tailTypes = events.slice(-3).map(e => e.type || 'unknown').join(', ')
+    const err = new Error(
+      tailTypes
+        ? `容器代理未返回最终结果（最后事件: ${tailTypes}）`
+        : '容器代理未返回任何结果',
+    )
+    err.events = events
+    throw err
+  },
+
+  // === Docker Agent 批量广播 ===
+  async docker_agent_broadcast({ nodeId, containerIds, message, timeout = DOCKER_TASK_TIMEOUT_MS } = {}) {
+    if (!containerIds || !containerIds.length) throw new Error('缺少 containerIds')
+    if (!message) throw new Error('缺少 message')
+
+    const cmd = { cmd: 'task.run', message, timeout }
+    const results = await Promise.allSettled(
+      containerIds.map(cid =>
+        handlers.docker_agent({ nodeId, containerId: cid, cmd })
+          .then(r => ({ containerId: cid, ...r }))
+      )
+    )
+
+    return results.map((r, i) => {
+      if (r.status === 'fulfilled') return r.value
+      return { containerId: containerIds[i], ok: false, error: r.reason?.message || '未知错误' }
+    })
+  },
+
+  // === 异步任务派发（非阻塞，立即返回 taskId） ===
+  async docker_dispatch_task({ nodeId, containerId, containerName, message, timeout = DOCKER_TASK_TIMEOUT_MS } = {}) {
+    if (!containerId) throw new Error('缺少 containerId')
+    if (!message) throw new Error('缺少 message')
+
+    const task = createTask(containerId, containerName, nodeId, message)
+    console.log(`[dispatch] 任务已派发 → ${task.containerName} (${task.id})`)
+
+    // 后台异步执行，不阻塞返回
+    const cmd = { cmd: 'task.run', message, timeout }
+    handlers.docker_agent({ nodeId, containerId, cmd })
+      .then(r => {
+        task.status = 'completed'
+        task.result = r
+        task.events = r.events || []
+        task.completedAt = Date.now()
+        console.log(`[dispatch] 任务完成 ✓ ${task.containerName} (${task.id}) — ${((task.completedAt - task.startedAt) / 1000).toFixed(1)}s`)
+      })
+      .catch(e => {
+        task.status = 'error'
+        task.error = e.message || String(e)
+        task.events = e.events || []
+        task.completedAt = Date.now()
+        console.error(`[dispatch] 任务失败 ✗ ${task.containerName} (${task.id}): ${task.error}`)
       })
 
-      ws.addEventListener('error', (e) => {
-        if (!done) {
-          done = true; clearTimeout(timer); clearTimeout(challengeTimer)
-          reject(new Error(`WebSocket 连接失败 ${wsUrl}: ${e.message || '连接被拒绝'}`))
-        }
+    return { taskId: task.id, containerId, containerName: task.containerName, status: 'running' }
+  },
+
+  // 批量异步派发（多个容器）
+  async docker_dispatch_broadcast({ nodeId, targets, message, timeout = DOCKER_TASK_TIMEOUT_MS } = {}) {
+    if (!targets || !targets.length) throw new Error('缺少 targets')
+    if (!message) throw new Error('缺少 message')
+
+    const taskIds = []
+    for (const t of targets) {
+      const result = await handlers.docker_dispatch_task({
+        nodeId: t.nodeId || nodeId,
+        containerId: t.containerId,
+        containerName: t.containerName,
+        message,
+        timeout,
       })
-      ws.addEventListener('close', (e) => {
-        clearTimeout(timer); clearTimeout(challengeTimer)
-        if (!done) {
-          done = true
-          if (result) resolve({ ok: true, result })
-          else if (e.code === 4001 || e.code === 4003) reject(new Error(`Gateway 认证失败 — 请检查容器 ${containerName} 的 Token 配置`))
-          else resolve({ ok: true, result: result || '（无回复）' })
-        }
-      })
-    })
+      taskIds.push(result)
+    }
+    return taskIds
+  },
+
+  // 查询单个任务状态
+  docker_task_status({ taskId } = {}) {
+    if (!taskId) throw new Error('缺少 taskId')
+    const task = _taskStore.get(taskId)
+    if (!task) throw new Error('任务不存在')
+    return {
+      id: task.id,
+      containerId: task.containerId,
+      containerName: task.containerName,
+      message: task.message,
+      status: task.status,
+      result: task.result,
+      error: task.error,
+      events: task.events,
+      startedAt: task.startedAt,
+      completedAt: task.completedAt,
+      elapsed: task.completedAt ? task.completedAt - task.startedAt : Date.now() - task.startedAt,
+    }
+  },
+
+  // 查询所有任务列表
+  docker_task_list({ containerId, status } = {}) {
+    let tasks = [..._taskStore.values()]
+    if (containerId) tasks = tasks.filter(t => t.containerId === containerId)
+    if (status) tasks = tasks.filter(t => t.status === status)
+    // 按时间倒序
+    tasks.sort((a, b) => b.startedAt - a.startedAt)
+    return tasks.map(t => ({
+      id: t.id,
+      containerId: t.containerId,
+      containerName: t.containerName,
+      message: t.message,
+      status: t.status,
+      error: t.error,
+      startedAt: t.startedAt,
+      completedAt: t.completedAt,
+      elapsed: t.completedAt ? t.completedAt - t.startedAt : Date.now() - t.startedAt,
+      hasResult: !!t.result,
+    }))
   },
 
   async docker_init_worker({ nodeId, containerId, role = 'general' } = {}) {
@@ -1215,14 +1767,24 @@ const handlers = {
         const syncConfig = {}
         if (localConfig.meta) syncConfig.meta = localConfig.meta // 保持原始 meta，不加自定义字段
         if (localConfig.env) syncConfig.env = localConfig.env
-        if (localConfig.models) syncConfig.models = localConfig.models
+        if (localConfig.models) {
+          // 容器内 127.0.0.1/localhost 指向容器自身，需替换为 host.docker.internal 访问宿主机
+          syncConfig.models = JSON.parse(JSON.stringify(localConfig.models, (k, v) => {
+            if (k === 'baseUrl' && typeof v === 'string') {
+              return v.replace(/\/\/127\.0\.0\.1([:/])/g, '//host.docker.internal$1')
+                      .replace(/\/\/localhost([:/])/g, '//host.docker.internal$1')
+            }
+            return v
+          }))
+        }
         if (localConfig.auth) syncConfig.auth = localConfig.auth
         // Gateway 配置：只设置 controlUi（允许连接），不复制 host/bind 等本机特定字段
         syncConfig.gateway = {
           port: 18789,
           mode: 'local',
           bind: 'lan',
-          controlUi: { allowedOrigins: ['*'] },
+          auth: { mode: 'token', token: CLUSTER_TOKEN },
+          controlUi: { allowedOrigins: ['*'], allowInsecureAuth: true },
         }
 
         const configB64 = b64(JSON.stringify(syncConfig, null, 2))
@@ -1235,7 +1797,28 @@ const handlers = {
       console.warn(`[init-worker] 配置同步失败: ${e.message}`)
     }
 
-    // 2. 角色性格注入（SOUL.md + IDENTITY.md + AGENTS.md）
+    // 2. 注入设备配对信息（绕过 Gateway 手动配对要求）
+    try {
+      const { deviceId, publicKey } = getOrCreateDeviceKey()
+      const platform = process.platform === 'darwin' ? 'macos' : process.platform
+      const nowMs = Date.now()
+      const pairedData = {}
+      pairedData[deviceId] = {
+        deviceId, publicKey, platform, deviceFamily: 'desktop',
+        clientId: 'openclaw-control-ui', clientMode: 'ui',
+        role: 'operator', roles: ['operator'],
+        scopes: SCOPES, approvedScopes: SCOPES, tokens: {},
+        createdAtMs: nowMs, approvedAtMs: nowMs,
+      }
+      const pairedB64 = b64(JSON.stringify(pairedData, null, 2))
+      await cExec(`mkdir -p /root/.openclaw/devices && echo '${pairedB64}' | base64 -d > /root/.openclaw/devices/paired.json`)
+      results.files.push('devices/paired.json')
+      console.log(`[init-worker] 设备配对已注入 → ${containerId.slice(0, 12)}`)
+    } catch (e) {
+      console.warn(`[init-worker] 设备配对注入失败: ${e.message}`)
+    }
+
+    // 3. 角色性格注入（SOUL.md + IDENTITY.md + AGENTS.md）
     try {
       // 角色性格模板
       const ROLE_SOULS = {
@@ -1278,14 +1861,21 @@ const handlers = {
       console.warn(`[init-worker] 兵种配置注入失败: ${e.message}`)
     }
 
-    // 5. 清理无效字段 + 重启 Gateway
+    // 4.5 注入 ClawPanel Agent（容器内专属控制代理）
     try {
-      // entrypoint 会 sed 注入 gateway.host（OpenClaw 不认识），doctor --fix 清理
-      await cExec('openclaw doctor --fix 2>/dev/null || true')
+      await injectAgentToContainer(containerId, node.endpoint, cExec)
+      results.files.push('clawpanel-agent.cjs')
+    } catch (e) {
+      console.warn(`[init-worker] Agent 注入失败: ${e.message}`)
+    }
+
+    // 5. 重启 Gateway
+    try {
       // 停止旧 Gateway
       await cExec('pkill -f openclaw-gateway 2>/dev/null; pkill -f "openclaw gateway" 2>/dev/null; sleep 1')
       // 启动新 Gateway — 作为独立 Detach exec 的主进程（不能 nohup &，shell 退出会 SIGTERM 杀子进程）
-      await cExec('mkdir -p /root/.openclaw/logs && exec openclaw gateway >> /root/.openclaw/logs/gateway.log 2>&1')
+      // --force 确保端口被占用时也能启动
+      await cExec('mkdir -p /root/.openclaw/logs && exec openclaw gateway --force >> /root/.openclaw/logs/gateway.log 2>&1')
       console.log(`[init-worker] Gateway 已重启 → ${containerId.slice(0, 12)}`)
     } catch (e) {
       console.warn(`[init-worker] Gateway 重启失败: ${e.message}`)
@@ -1927,75 +2517,6 @@ const handlers = {
     }
   },
 
-  // 扩展工具
-  get_cftunnel_status() {
-    // 优先使用 cftunnel CLI（跨平台）
-    const bin = isWindows ? 'cftunnel.exe' : 'cftunnel'
-    try {
-      execSync(`${bin} --version`, { timeout: 3000, windowsHide: true, stdio: 'pipe' })
-    } catch {
-      return { installed: false }
-    }
-    // 已安装，获取状态
-    let running = false, pid = null, tunnel_name = ''
-    try {
-      const statusOut = execSync(`${bin} status 2>&1`, { timeout: 5000, windowsHide: true }).toString()
-      if (statusOut.includes('运行中')) running = true
-      const pidMatch = statusOut.match(/PID[：:]\s*(\d+)/)
-      if (pidMatch) pid = parseInt(pidMatch[1])
-      const nameMatch = statusOut.match(/隧道[：:]\s*([^\s(]+)/)
-      if (nameMatch) tunnel_name = nameMatch[1]
-    } catch {}
-    // 补充进程检测
-    if (!running) {
-      try {
-        if (isWindows) {
-          const out = execSync('tasklist /FI "IMAGENAME eq cftunnel.exe" /FO CSV /NH 2>nul', { timeout: 3000, windowsHide: true }).toString()
-          if (out.includes('cftunnel.exe')) running = true
-        } else {
-          const out = execSync('pgrep -f cftunnel 2>/dev/null', { timeout: 3000 }).toString().trim()
-          if (out) { running = true; pid = pid || parseInt(out.split('\n')[0]) || null }
-        }
-      } catch {}
-    }
-    // 获取路由列表
-    let routes = []
-    try {
-      const listOut = execSync(`${bin} list 2>&1`, { timeout: 5000, windowsHide: true }).toString()
-      const lines = listOut.split('\n').filter(l => l.trim() && !l.includes('---') && !l.toLowerCase().includes('name'))
-      routes = lines.map(l => {
-        const parts = l.split(/\s{2,}|\t/).map(s => s.trim()).filter(Boolean)
-        return parts.length >= 3 ? { name: parts[0], domain: parts[1], service: parts[2] } : null
-      }).filter(Boolean)
-    } catch {}
-    return { installed: true, running, pid, tunnel_name, routes }
-  },
-
-  get_clawapp_status() {
-    const port = 3210
-    let running = false, pid = null
-    // 检测端口是否在监听
-    try {
-      if (isWindows) {
-        const out = execSync(`netstat -ano | findstr :${port} | findstr LISTENING`, { timeout: 3000, windowsHide: true }).toString().trim()
-        if (out) {
-          running = true
-          const parts = out.split(/\s+/)
-          pid = parseInt(parts[parts.length - 1]) || null
-        }
-      } else {
-        const out = execSync(`lsof -i :${port} -t 2>/dev/null`, { timeout: 3000 }).toString().trim()
-        if (out) { running = true; pid = parseInt(out.split('\n')[0]) || null }
-      }
-    } catch {}
-    // 检测是否安装（多个可能路径）
-    const candidates = isWindows
-      ? [path.join(homedir(), 'Desktop\\clawapp'), path.join(homedir(), 'clawapp')]
-      : [path.join(homedir(), 'Desktop/clawapp'), path.join(homedir(), 'clawapp'), '/opt/clawapp']
-    const installed = candidates.some(p => fs.existsSync(p))
-    return { installed, running, pid, port, url: `http://localhost:${port}` }
-  },
-
   // 设备配对 + Gateway 握手
   auto_pair_device() {
     const originsChanged = patchGatewayOrigins()
@@ -2326,68 +2847,6 @@ const handlers = {
     return true
   },
 
-  // === 扩展工具操作（Web 模式） ===
-
-  cftunnel_action({ action }) {
-    const bin = isWindows ? 'cftunnel.exe' : 'cftunnel'
-    const cmd = action === 'up' ? `${bin} up -d` : `${bin} down`
-    try {
-      execSync(cmd, { timeout: 15000, windowsHide: true }).toString()
-      return true
-    } catch (e) {
-      throw new Error(`cftunnel ${action} 失败: ${e.stderr?.toString() || e.message}`)
-    }
-  },
-
-  get_cftunnel_logs({ lines = 20 }) {
-    const bin = isWindows ? 'cftunnel.exe' : 'cftunnel'
-    // 优先使用 cftunnel log 命令
-    try {
-      return execSync(`${bin} log -n ${lines} 2>&1`, { timeout: 5000, windowsHide: true }).toString()
-    } catch {}
-    // 回退：直接读日志文件
-    const logPath = path.join(homedir(), '.cftunnel', 'cftunnel.log')
-    if (!fs.existsSync(logPath)) return '暂无日志'
-    try {
-      if (!isWindows) {
-        return execSync(`tail -${lines} "${logPath}" 2>&1`, { timeout: 3000 }).toString()
-      }
-      const content = fs.readFileSync(logPath, 'utf8')
-      return content.split('\n').slice(-lines).join('\n')
-    } catch {
-      const content = fs.readFileSync(logPath, 'utf8')
-      return content.split('\n').slice(-lines).join('\n')
-    }
-  },
-
-  install_cftunnel() {
-    try {
-      let out
-      if (isWindows) {
-        out = execSync('powershell -NoProfile -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP install-cftunnel.ps1; Invoke-WebRequest -Uri https://raw.githubusercontent.com/qingchencloud/cftunnel/main/install.ps1 -OutFile $tmp -UseBasicParsing; & $tmp; Remove-Item $tmp -ErrorAction SilentlyContinue"', { timeout: 120000, windowsHide: true }).toString()
-      } else {
-        out = execSync('curl -fsSL https://raw.githubusercontent.com/qingchencloud/cftunnel/main/install.sh | bash', { timeout: 120000 }).toString()
-      }
-      return `安装完成\n${out.slice(-500)}`
-    } catch (e) {
-      throw new Error('安装失败: ' + (e.stderr?.toString() || e.message).slice(-500))
-    }
-  },
-
-  install_clawapp() {
-    try {
-      let out
-      if (isWindows) {
-        out = execSync('powershell -NoProfile -ExecutionPolicy Bypass -Command "$tmp = Join-Path $env:TEMP install-clawapp.ps1; Invoke-WebRequest -Uri https://raw.githubusercontent.com/qingchencloud/clawapp/main/install.ps1 -OutFile $tmp -UseBasicParsing; & $tmp -Auto; Remove-Item $tmp -ErrorAction SilentlyContinue"', { timeout: 300000, windowsHide: true }).toString()
-      } else {
-        out = execSync('curl -fsSL https://raw.githubusercontent.com/qingchencloud/clawapp/main/install.sh | bash', { timeout: 300000 }).toString()
-      }
-      return `安装完成\n${out.slice(-500)}`
-    } catch (e) {
-      throw new Error('安装失败: ' + (e.stderr?.toString() || e.message).slice(-500))
-    }
-  },
-
   // === Agent 管理（Web 模式） ===
 
   add_agent({ name, model, workspace }) {
@@ -2586,6 +3045,13 @@ async function _apiMiddleware(req, res, next) {
   if (!req.url?.startsWith('/__api/')) return next()
 
   const cmd = req.url.slice(7).split('?')[0]
+
+  // --- 健康检查（前端用于检测后端是否在线） ---
+  if (cmd === 'health') {
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ ok: true, ts: Date.now() }))
+    return
+  }
 
   // --- 认证特殊处理 ---
   if (cmd === 'auth_check') {

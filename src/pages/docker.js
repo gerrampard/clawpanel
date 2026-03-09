@@ -7,6 +7,10 @@ import { toast } from '../components/toast.js'
 import { showConfirm } from '../components/modal.js'
 import { icon } from '../lib/icons.js'
 import { pixelRole, pixelBarracks } from '../lib/pixel-roles.js'
+import { getActiveInstance, switchInstance } from '../lib/app-state.js'
+import { renderSidebar } from '../components/sidebar.js'
+import { reloadCurrentRoute } from '../router.js'
+import { DOCKER_TASK_TIMEOUT_MS, buildDockerDispatchTargets, buildDockerInstanceSwitchContext } from '../lib/docker-tasking.js'
 
 function esc(str) {
   if (!str) return ''
@@ -89,6 +93,7 @@ function roleIcon(role, size = 14) {
 }
 
 let _refreshTimer = null
+let _workspaceTimer = null
 let _lastContainers = []
 
 export async function render() {
@@ -115,13 +120,24 @@ export async function render() {
         </div>
       </div>
       <div class="task-pick-bar" id="task-pick" style="display:none"></div>
+      <div class="task-beta-note">
+        <span class="task-beta-icon">${icon('alert-triangle', 12)}</span>
+        <span>测试功能，当前能力与稳定性仍在完善中。</span>
+      </div>
       <div class="task-input-row">
         <textarea class="task-input" id="task-input" rows="1" placeholder="输入任务指令，分配给龙虾兵执行..."></textarea>
         <button class="task-send-btn" id="task-send" disabled>${icon('send', 16)}</button>
       </div>
     </div>
 
-    <div class="task-results" id="task-results"></div>
+    <div class="task-workspace" id="task-workspace" style="display:none">
+      <div class="workspace-header">
+        <span class="workspace-title">${icon('activity', 14)} 异步工作区</span>
+        <button class="btn btn-sm" data-action="workspace-clear">${icon('x', 12)} 清空历史</button>
+      </div>
+      <div class="workspace-workers" id="workspace-workers"></div>
+      <div class="workspace-history" id="workspace-history"></div>
+    </div>
 
     <div class="section-bar">
       <span class="section-title">${icon('swords', 14)} 兵力部署</span>
@@ -129,9 +145,12 @@ export async function render() {
         <div class="batch-actions" id="batch-actions" style="display:none">
           <label class="batch-select-all"><input type="checkbox" id="ct-select-all"/> 全选</label>
           <span class="batch-count" id="batch-count">0 已选</span>
-          <button class="btn btn-sm" data-action="batch-start">${icon('play', 12)} 出征</button>
-          <button class="btn btn-sm" data-action="batch-stop">${icon('stop', 12)} 休整</button>
-          <button class="btn btn-sm" data-action="batch-restart">${icon('refresh-cw', 12)} 整编</button>
+          <button class="btn btn-sm batch-btn" data-action="batch-start" disabled>${icon('play', 12)} 出征</button>
+          <button class="btn btn-sm batch-btn" data-action="batch-stop" disabled>${icon('stop', 12)} 休整</button>
+          <button class="btn btn-sm batch-btn" data-action="batch-restart" disabled>${icon('refresh-cw', 12)} 整编</button>
+          <button class="btn btn-sm batch-btn" data-action="batch-sync" disabled>${icon('upload', 12)} 同步配置</button>
+          <button class="btn btn-sm batch-btn" data-action="batch-rebuild" disabled>${icon('hammer', 12)} 重建</button>
+          <button class="btn btn-sm batch-btn danger" data-action="batch-remove" disabled>${icon('trash', 12)} 退役</button>
         </div>
       </div>
     </div>
@@ -154,6 +173,7 @@ export async function render() {
 
 export function cleanup() {
   if (_refreshTimer) { clearInterval(_refreshTimer); _refreshTimer = null }
+  if (_workspaceTimer) { clearInterval(_workspaceTimer); _workspaceTimer = null }
 }
 
 async function loadClusterOverview(page) {
@@ -288,7 +308,11 @@ function _renderUnitCard(c, showAdopt) {
     </div>`
   }
 
-  return `<div class="unit-card ${stateClass}" style="--unit-color:${roleInfo.color}">
+  // 检查是否为当前管理的活跃实例
+  const activeInst = getActiveInstance()
+  const isActive = activeInst.type === 'docker' && activeInst.id === `docker-${c.id.slice(0, 12)}`
+
+  return `<div class="unit-card ${stateClass}${isActive ? ' active-instance' : ''}" style="--unit-color:${roleInfo.color}">
     <div class="unit-card-select">
       <input type="checkbox" class="ct-select" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" data-state="${esc(c.state)}"/>
     </div>
@@ -298,6 +322,12 @@ function _renderUnitCard(c, showAdopt) {
         <div class="unit-name">${esc(c.name)}</div>
         <div class="unit-role">${icon(roleInfo.iconName, 12)} ${roleInfo.title} — ${roleInfo.desc}</div>
       </div>
+      ${isActive
+        ? `<span class="unit-active-tag">${icon('monitor', 10)} 管理中</span>`
+        : isRunning && ports.panel
+          ? `<button class="btn btn-xs unit-switch-btn" data-action="switch-instance" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" data-name="${esc(c.name)}" data-port="${ports.panel}" data-gateway-port="${esc(ports.gateway || '')}">${icon('arrow-right', 10)} 切换管理</button>`
+          : ''
+      }
       <span class="unit-state ${stateClass}">${isRunning ? icon('swords', 12) + ' 出征中' : icon('tent', 12) + ' 休整中'}</span>
     </div>
     ${isRunning && (ports.panel || ports.gateway) ? `
@@ -315,6 +345,7 @@ function _renderUnitCard(c, showAdopt) {
              <button class="btn-icon" data-action="sync-config" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" data-name="${esc(c.name)}" data-role="${esc(role)}" title="同步配置（API Key + 性格 + 记忆）">${icon('upload', 14)}</button>`
           : `<button class="btn-icon" data-action="start" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="出征">${icon('play', 14)}</button>`
         }
+        <button class="btn-icon" data-action="rebuild" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" data-name="${esc(c.name)}" title="重建（拉取最新镜像重新创建）">${icon('hammer', 14)}</button>
         <button class="btn-icon" data-action="inspect" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="军情">${icon('search', 14)}</button>
         <button class="btn-icon" data-action="logs" data-ct="${esc(c.id)}" data-node="${esc(c.nodeId)}" title="战报">${icon('clipboard', 14)}</button>
         ${isAdopted ? `<button class="btn-icon" data-action="unadopt" data-ct="${esc(c.id)}" title="脱编">${icon('x', 14)}</button>` : ''}
@@ -346,9 +377,10 @@ function renderWorkers(page, nodes) {
 
   el.innerHTML = `<div class="unit-grid">${managed.map(c => _renderUnitCard(c, false)).join('')}</div>`
 
-  // 有军团成员时显示批量操作栏
+  // 有军团成员时显示批量操作栏 + 重置全选状态
   const batchEl = page.querySelector('#batch-actions')
   if (batchEl) batchEl.style.display = managed.length > 0 ? 'flex' : 'none'
+  _updateBatchUI(page)
 }
 
 function renderOthers(page, nodes) {
@@ -426,17 +458,6 @@ function _smartRoute(command) {
   return _runningWorkers.length > 0 ? [_runningWorkers[0]] : []
 }
 
-async function _sendToWorker(worker, command, onChunk) {
-  if (!worker.id) throw new Error(`${worker.name} 缺少容器 ID`)
-  if (onChunk) onChunk('⏳ 连接 Gateway...')
-  try {
-    const resp = await api.dockerGatewayChat(worker.nodeId || null, worker.id, command)
-    return resp?.result || '（无回复）'
-  } catch (e) {
-    throw new Error(`${worker.name}: ${e.message}`)
-  }
-}
-
 function initTaskHub(page) {
   const input = page.querySelector('#task-input')
   const sendBtn = page.querySelector('#task-send')
@@ -486,71 +507,216 @@ function initTaskHub(page) {
 
     if (targets.length === 0) { toast('没有可用的目标', 'error'); return }
 
-    // 渲染结果区
-    const resultsEl = page.querySelector('#task-results')
-    resultsEl.style.display = ''
-    resultsEl.innerHTML = `
-      <div class="task-results-header">
-        <span>${icon('clipboard', 14)} 任务执行 · ${targets.length} 个目标</span>
-        <span class="task-results-mode">${currentMode === 'broadcast' ? '全体广播' : currentMode === 'smart' ? '智能分配' : '指定成员'}</span>
-      </div>
-      <div class="task-results-grid">
-        ${targets.map(w => {
-          const r = MILITARY.roles[w.role]
-          return `<div class="task-result-card" id="result-${w.id}">
-            <div class="task-result-header" style="--worker-color:${r.color}">
-              ${pixelRole(w.role, 20)}
-              <span class="task-result-name">${esc(w.name.replace(/^openclaw-/, ''))}</span>
-              <span class="task-result-status pending">${icon('radio', 10)} 等待中</span>
-            </div>
-            <div class="task-result-body"><span class="typing-cursor"></span></div>
-          </div>`
-        }).join('')}
-      </div>
-    `
-
+    // 异步派发 — 立即返回，不阻塞 UI
     sendBtn.disabled = true
-    input.disabled = true
+    try {
+      const dispatchTargets = buildDockerDispatchTargets(targets)
+      await api.dockerDispatchBroadcast(null, dispatchTargets, command, DOCKER_TASK_TIMEOUT_MS)
+      toast(`任务已派发给 ${targets.length} 名龙虾兵`, 'success')
+    } catch (e) {
+      toast(`派发失败: ${e.message}`, 'error')
+      sendBtn.disabled = false
+      return
+    }
 
-    // 并发发送到所有目标
-    const promises = targets.map(async (w) => {
-      const card = resultsEl.querySelector(`#result-${w.id}`)
-      const statusEl = card?.querySelector('.task-result-status')
-      const bodyEl = card?.querySelector('.task-result-body')
-      if (statusEl) { statusEl.className = 'task-result-status running'; statusEl.innerHTML = `${icon('zap', 10)} 执行中` }
-
-      try {
-        const result = await _sendToWorker(w, command, (partial) => {
-          if (bodyEl) bodyEl.textContent = partial
-          bodyEl?.scrollTo(0, bodyEl.scrollHeight)
-        })
-        if (bodyEl) bodyEl.textContent = result || '（无回复）'
-        if (statusEl) { statusEl.className = 'task-result-status done'; statusEl.innerHTML = `${icon('check-circle', 10)} 完成` }
-      } catch (e) {
-        if (bodyEl) bodyEl.textContent = `失败: ${e.message}`
-        if (statusEl) { statusEl.className = 'task-result-status error'; statusEl.innerHTML = `${icon('x-circle', 10)} 失败` }
-      }
-    })
-
-    await Promise.allSettled(promises)
-
-    sendBtn.disabled = false
-    input.disabled = false
+    // 清空输入，启动工作区轮询
     input.value = ''
     input.style.height = 'auto'
-    input.focus()
+    sendBtn.disabled = !input.value.trim() || _runningWorkers.length === 0
+    _startWorkspacePolling(page)
+    _refreshWorkspace(page)
+  }
+}
+
+// === 异步工作区 ===
+
+function _startWorkspacePolling(page) {
+  if (_workspaceTimer) return
+  _workspaceTimer = setInterval(() => _refreshWorkspace(page), 3000)
+}
+
+function _stopWorkspacePolling() {
+  if (_workspaceTimer) { clearInterval(_workspaceTimer); _workspaceTimer = null }
+}
+
+async function _refreshWorkspace(page) {
+  const wsEl = page.querySelector('#task-workspace')
+  if (!wsEl) return
+
+  try {
+    const tasks = await api.dockerTaskList()
+    if (!tasks || tasks.length === 0) {
+      wsEl.style.display = 'none'
+      _stopWorkspacePolling()
+      return
+    }
+
+    wsEl.style.display = ''
+    _renderWorkspaceWorkers(page, tasks)
+    _renderWorkspaceHistory(page, tasks)
+
+    // 没有正在运行的任务时停止轮询
+    const hasRunning = tasks.some(t => t.status === 'running')
+    if (!hasRunning) _stopWorkspacePolling()
+  } catch (e) {
+    console.warn('[workspace] 刷新失败:', e.message)
+  }
+}
+
+function _renderWorkspaceWorkers(page, tasks) {
+  const el = page.querySelector('#workspace-workers')
+  if (!el) return
+
+  // 用 containerId 去重，取每个容器最新的任务
+  const latestByContainer = new Map()
+  for (const t of tasks) {
+    if (!latestByContainer.has(t.containerId) || t.startedAt > latestByContainer.get(t.containerId).startedAt) {
+      latestByContainer.set(t.containerId, t)
+    }
+  }
+
+  // 只展示有任务的工人
+  const workers = [...latestByContainer.values()]
+  if (workers.length === 0) { el.innerHTML = ''; return }
+
+  el.innerHTML = `<div class="ws-worker-grid">${workers.map(t => {
+    const role = MILITARY.inferRole(t.containerName)
+    const r = MILITARY.roles[role] || MILITARY.roles.general
+    const shortName = (t.containerName || '').replace(/^openclaw-/, '')
+    const isRunning = t.status === 'running'
+    const isError = t.status === 'error'
+    const elapsed = t.elapsed ? (t.elapsed / 1000).toFixed(0) : '0'
+    const msgPreview = (t.message || '').slice(0, 40) + ((t.message || '').length > 40 ? '...' : '')
+
+    return `<div class="ws-worker ${isRunning ? 'working' : 'idle'}" data-task-id="${esc(t.id)}" style="--worker-color:${r.color}">
+      <div class="ws-worker-top">
+        ${pixelRole(role, 28)}
+        <div class="ws-worker-info">
+          <div class="ws-worker-name">${esc(shortName)}</div>
+          <div class="ws-worker-role">${r.title} — ${r.desc}</div>
+        </div>
+        <div class="ws-worker-badge ${isRunning ? 'running' : isError ? 'error' : 'done'}">
+          ${isRunning ? `${icon('zap', 10)} 工作中` : isError ? `${icon('x-circle', 10)} 失败` : `${icon('check-circle', 10)} 完成`}
+        </div>
+      </div>
+      <div class="ws-worker-task">
+        <div class="ws-worker-msg">${icon('message-square', 10)} ${esc(msgPreview)}</div>
+        <div class="ws-worker-time">${isRunning ? `⏱ ${elapsed}s...` : `${elapsed}s`}</div>
+      </div>
+    </div>`
+  }).join('')}</div>`
+}
+
+function _renderWorkspaceHistory(page, tasks) {
+  const el = page.querySelector('#workspace-history')
+  if (!el) return
+
+  // 只显示已完成/失败的任务
+  const finished = tasks.filter(t => t.status !== 'running')
+  if (finished.length === 0) { el.innerHTML = ''; return }
+
+  el.innerHTML = `
+    <div class="ws-history-title">${icon('clock', 12)} 任务记录</div>
+    <div class="ws-history-list">
+      ${finished.map(t => {
+        const shortName = (t.containerName || '').replace(/^openclaw-/, '')
+        const elapsed = t.elapsed ? (t.elapsed / 1000).toFixed(1) : '0'
+        const msgPreview = (t.message || '').slice(0, 50) + ((t.message || '').length > 50 ? '...' : '')
+        const isError = t.status === 'error'
+        const time = new Date(t.startedAt)
+        const timeStr = `${time.getHours().toString().padStart(2,'0')}:${time.getMinutes().toString().padStart(2,'0')}`
+        return `<div class="ws-history-item ${isError ? 'error' : 'done'}" data-task-id="${esc(t.id)}">
+          <span class="ws-history-icon">${isError ? icon('x-circle', 12) : icon('check-circle', 12)}</span>
+          <span class="ws-history-name">${esc(shortName)}</span>
+          <span class="ws-history-msg">${esc(msgPreview)}</span>
+          <span class="ws-history-meta">${elapsed}s · ${timeStr}</span>
+          ${t.hasResult ? `<button class="btn btn-xs btn-secondary ws-history-view" data-task-id="${esc(t.id)}">查看结果</button>` : ''}
+        </div>`
+      }).join('')}
+    </div>
+  `
+}
+
+async function _showTaskDetail(page, taskId) {
+  try {
+    const task = await api.dockerTaskStatus(taskId)
+    if (!task) { toast('任务不存在', 'error'); return }
+
+    const shortName = (task.containerName || '').replace(/^openclaw-/, '')
+    const elapsed = task.elapsed ? (task.elapsed / 1000).toFixed(1) : '0'
+    const isError = task.status === 'error'
+
+    // 提取结果文本
+    let resultText = ''
+    if (task.result?.result) {
+      resultText = task.result.result
+    } else if (task.error) {
+      resultText = `错误: ${task.error}`
+    } else if (task.events?.length) {
+      const finals = task.events.filter(e => e.type === 'final' || e.type === 'result')
+      resultText = finals.map(e => e.text || e.message || JSON.stringify(e)).join('\n')
+    }
+    if (!resultText) resultText = '（无回复）'
+
+    // 提取工具调用日志
+    const toolCalls = (task.events || []).filter(e => e.type === 'tool_call' || e.type === 'tool_result')
+    const toolHtml = toolCalls.length > 0 ? `
+      <div class="task-detail-section">
+        <div class="task-detail-label">${icon('gear', 12)} 工具调用 (${toolCalls.length})</div>
+        <div class="task-detail-tools">
+          ${toolCalls.map(tc => `<div class="task-detail-tool">
+            <code>${esc(tc.name || tc.tool || tc.type)}</code>
+            ${tc.input ? `<pre>${esc(typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input, null, 2)).slice(0, 500)}</pre>` : ''}
+            ${tc.output ? `<pre class="tool-output">${esc(typeof tc.output === 'string' ? tc.output : JSON.stringify(tc.output, null, 2)).slice(0, 500)}</pre>` : ''}
+          </div>`).join('')}
+        </div>
+      </div>
+    ` : ''
+
+    // 展示详情弹窗
+    const { showConfirm: _ } = await import('../components/modal.js')
+    const overlay = document.createElement('div')
+    overlay.className = 'task-detail-overlay'
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove() }
+    overlay.innerHTML = `
+      <div class="task-detail-modal">
+        <div class="task-detail-header">
+          <span>${isError ? icon('x-circle', 16) : icon('check-circle', 16)} ${esc(shortName)} — 任务详情</span>
+          <button class="btn btn-sm" onclick="this.closest('.task-detail-overlay').remove()">${icon('x', 14)}</button>
+        </div>
+        <div class="task-detail-body">
+          <div class="task-detail-section">
+            <div class="task-detail-label">${icon('message-square', 12)} 指令</div>
+            <div class="task-detail-content">${esc(task.message)}</div>
+          </div>
+          <div class="task-detail-section">
+            <div class="task-detail-label">${isError ? icon('x-circle', 12) + ' 错误' : icon('check-circle', 12) + ' 结果'}</div>
+            <pre class="task-detail-result ${isError ? 'error' : ''}">${esc(resultText)}</pre>
+          </div>
+          ${toolHtml}
+          <div class="task-detail-meta">
+            耗时 ${elapsed}s · ${new Date(task.startedAt).toLocaleTimeString()}
+          </div>
+        </div>
+      </div>
+    `
+    document.body.appendChild(overlay)
+  } catch (e) {
+    toast(`加载任务详情失败: ${e.message}`, 'error')
   }
 }
 
 function _updateBatchUI(page) {
   const checks = page.querySelectorAll('.ct-select:checked')
-  const batchEl = page.querySelector('#batch-actions')
   const countEl = page.querySelector('#batch-count')
-  if (batchEl) batchEl.style.display = checks.length > 0 ? 'flex' : 'none'
   if (countEl) countEl.textContent = `${checks.length} 名已选`
   const selectAll = page.querySelector('#ct-select-all')
   const allChecks = page.querySelectorAll('.ct-select')
   if (selectAll && allChecks.length) selectAll.checked = checks.length === allChecks.length
+  // 批量按钮启用/禁用
+  for (const btn of page.querySelectorAll('.batch-btn')) {
+    btn.disabled = checks.length === 0
+  }
 }
 
 function bindEvents(page) {
@@ -566,30 +732,131 @@ function bindEvents(page) {
   })
 
   page.addEventListener('click', async (e) => {
+    // 工作区：点击工人卡片或历史条目查看详情
+    const wsWorker = e.target.closest('.ws-worker[data-task-id]')
+    const wsView = e.target.closest('.ws-history-view[data-task-id]')
+    const wsItem = e.target.closest('.ws-history-item[data-task-id]')
+    if (wsView) { _showTaskDetail(page, wsView.dataset.taskId); return }
+    if (wsWorker && !wsWorker.querySelector('.ws-worker-badge.running')) { _showTaskDetail(page, wsWorker.dataset.taskId); return }
+    if (wsItem && !wsView) { _showTaskDetail(page, wsItem.dataset.taskId); return }
+
     const btn = e.target.closest('[data-action]')
     if (!btn) return
     const action = btn.dataset.action
+
+    // 工作区清空
+    if (action === 'workspace-clear') {
+      const wsEl = page.querySelector('#task-workspace')
+      if (wsEl) wsEl.style.display = 'none'
+      _stopWorkspacePolling()
+      return
+    }
+
+    // 切换管理实例
+    if (action === 'switch-instance') {
+      const ct = btn.dataset.ct
+      const name = btn.dataset.name
+      const port = btn.dataset.port
+      const gatewayPort = btn.dataset.gatewayPort
+      const nodeId = btn.dataset.node || null
+      if (!ct || !port) return
+      const switchCtx = buildDockerInstanceSwitchContext({
+        containerId: ct,
+        name,
+        port,
+        gatewayPort,
+        nodeId,
+      })
+      const originalHtml = btn.innerHTML
+      btn.disabled = true
+      btn.textContent = '切换中...'
+      try {
+        await switchInstance(switchCtx.instanceId)
+        toast(`已切换管理 → ${name}（模型配置、Agent 等将管理该士兵）`, 'success')
+        const sidebar = document.getElementById('sidebar')
+        if (sidebar) renderSidebar(sidebar)
+        if (switchCtx.reloadRoute) {
+          reloadCurrentRoute()
+          return
+        }
+        await loadClusterOverview(page)
+      } catch (e) {
+        try {
+          const added = await api.instanceAdd(switchCtx.registration)
+          await switchInstance(added.id)
+          toast(`已注册并切换管理 → ${name}`, 'success')
+          const sidebar = document.getElementById('sidebar')
+          if (sidebar) renderSidebar(sidebar)
+          if (switchCtx.reloadRoute) {
+            reloadCurrentRoute()
+            return
+          }
+          await loadClusterOverview(page)
+        } catch (e2) {
+          btn.disabled = false
+          btn.innerHTML = originalHtml
+          toast(`切换失败: ${e2.message}`, 'error')
+        }
+      }
+      return
+    }
 
     // 批量操作
     if (action.startsWith('batch-')) {
       const op = action.replace('batch-', '')
       const checks = page.querySelectorAll('.ct-select:checked')
       if (checks.length === 0) { toast('请先勾选士兵', 'error'); return }
-      const opName = op === 'start' ? '出征' : op === 'stop' ? '休整' : '整编'
-      const ok = await showConfirm(`军令：${opName} ${checks.length} 名士兵？`, '将对所有已勾选的士兵执行命令。')
+
+      const OP_NAMES = { start: '出征', stop: '休整', restart: '整编', sync: '同步配置', rebuild: '重建', remove: '退役' }
+      const opName = OP_NAMES[op] || op
+
+      const confirmMsgs = {
+        start: '将启动所有已勾选的士兵。',
+        stop: '将停止所有已勾选的士兵。',
+        restart: '将重启所有已勾选的士兵。',
+        sync: '将向所有已勾选的士兵同步 API Key、兵种配置和 Agent。',
+        rebuild: '将拉取最新镜像并重建所有已勾选的士兵（数据卷保留）。\n⚠ 重建过程中士兵将暂时离线。',
+        remove: '⚠ 此操作不可撤销！将永久退役所有已勾选的士兵。',
+      }
+
+      const ok = await showConfirm(`军令：${opName} ${checks.length} 名士兵？`, confirmMsgs[op] || '将对所有已勾选的士兵执行命令。')
       if (!ok) return
-      toast(`正在执行军令: ${opName}...`)
+
+      toast(`正在执行军令: ${opName}...`, 'info')
+
+      // 禁用所有批量按钮
+      page.querySelectorAll('.batch-btn').forEach(b => b.disabled = true)
+
       let success = 0, fail = 0
+      const total = checks.length
+      const errors = []
+
       for (const cb of checks) {
+        const nId = cb.dataset.node, cId = cb.dataset.ct
+        const cName = cb.closest('.unit-card')?.querySelector('.unit-name')?.textContent || cId
         try {
-          const nId = cb.dataset.node, cId = cb.dataset.ct
           if (op === 'start') await api.dockerStartContainer(nId, cId)
           else if (op === 'stop') await api.dockerStopContainer(nId, cId)
           else if (op === 'restart') await api.dockerRestartContainer(nId, cId)
+          else if (op === 'sync') {
+            const role = MILITARY.inferRole(cName)
+            await api.dockerInitWorker(nId, cId, role)
+          }
+          else if (op === 'rebuild') await api.dockerRebuildContainer(nId, cId, true)
+          else if (op === 'remove') await api.dockerRemoveContainer(nId, cId, true)
           success++
-        } catch { fail++ }
+          toast(`${opName}进度: ${success + fail}/${total}`, 'info')
+        } catch (e) {
+          fail++
+          errors.push(`${cName}: ${e.message}`)
+          console.error(`[batch-${op}] ${cName} 失败:`, e.message)
+        }
       }
-      toast(`军令执行完毕: ${success} 名${opName}${fail ? `，${fail} 名失败` : ''}`)
+
+      const resultType = fail === 0 ? 'success' : fail === total ? 'error' : 'info'
+      let msg = `军令执行完毕: ${success} 名${opName}${fail ? `，${fail} 名失败` : ''}`
+      if (errors.length > 0) msg += `\n${errors.slice(0, 3).join('\n')}${errors.length > 3 ? `\n...还有 ${errors.length - 3} 个错误` : ''}`
+      toast(msg, resultType)
       await loadClusterOverview(page)
       return
     }
@@ -685,6 +952,23 @@ function bindEvents(page) {
       return
     }
 
+    if (action === 'rebuild') {
+      const name = btn.dataset.name || containerId
+      const ok = await showConfirm(`重建 ${name}？`, '将拉取最新镜像并重新创建容器，数据卷保留。\n重建期间士兵将暂时离线。')
+      if (!ok) return
+      btn.disabled = true
+      toast(`正在重建 ${name}...`, 'info')
+      try {
+        const result = await api.dockerRebuildContainer(nodeId, containerId, true)
+        toast(`${result.name || name} 已重建完成`, 'success')
+        await loadClusterOverview(page)
+      } catch (e) {
+        toast(`${name} 重建失败: ${e.message}`, 'error')
+        btn.disabled = false
+      }
+      return
+    }
+
     if (action === 'sync-config') {
       const cid = btn.dataset.ct
       const nid = btn.dataset.node || null
@@ -696,7 +980,7 @@ function bindEvents(page) {
         const count = result?.files?.length || 0
         // docker_init_worker 内部已重启 Gateway，不需要重启容器（重启会触发 entrypoint 覆盖配置）
         toast(`${name}: 已同步 ${count} 个文件，Gateway 已重启`, 'success')
-        setTimeout(() => refreshCluster(page), 3000)
+        setTimeout(() => loadClusterOverview(page), 3000)
       } catch (e) {
         toast(`${name} 同步失败: ${e.message}`, 'error')
       }
@@ -709,7 +993,7 @@ function bindEvents(page) {
       const name = btn.dataset.name || cid
       toast(`正在连接 ${name} 的 Gateway...`, 'info')
       try {
-        const resp = await api.dockerGatewayChat(nid, cid, '你好，报告你的兵种和状态')
+        const resp = await api.dockerAgent(nid, cid, { cmd: 'task.run', message: '你好，报告你的兵种和状态' })
         toast(`${name} 回复: ${(resp?.result || '（无回复）').slice(0, 100)}`, 'success')
       } catch (e) {
         toast(`${name} 通讯失败: ${e.message}`, 'error')

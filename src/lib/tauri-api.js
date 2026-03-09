@@ -1,32 +1,17 @@
 /**
  * Tauri API 封装层
- * 开发阶段用 mock 数据，Tauri 环境用 invoke
+ * Tauri 环境用 invoke，Web 模式走 dev-api 后端
  */
+import { DOCKER_TASK_TIMEOUT_MS } from './docker-tasking.js'
 
 const isTauri = !!window.__TAURI_INTERNALS__
-
-// 写操作不应静默回退 mock（否则会“假成功”）
-const NO_MOCK_CMDS = new Set([
-  'start_service', 'stop_service', 'restart_service',
-  'upgrade_openclaw', 'install_gateway', 'uninstall_gateway',
-  'write_openclaw_config', 'write_mcp_config',
-  'create_backup', 'restore_backup', 'delete_backup',
-  'write_memory_file', 'delete_memory_file',
-  'set_npm_registry', 'reload_gateway', 'restart_gateway',
-  'auto_pair_device',
-  'assistant_exec', 'assistant_write_file',
-  'docker_create_container', 'docker_start_container', 'docker_stop_container',
-  'docker_restart_container', 'docker_remove_container', 'docker_container_exec', 'docker_gateway_chat', 'docker_pull_image',
-  'docker_add_node', 'docker_remove_node',
-  'instance_add', 'instance_remove', 'instance_set_active',
-])
 
 // 仅在 Node.js 后端实现的命令（Tauri Rust 不处理），强制走 webInvoke
 const WEB_ONLY_CMDS = new Set([
   'docker_test_endpoint',
   'docker_info', 'docker_list_containers', 'docker_create_container',
   'docker_start_container', 'docker_stop_container', 'docker_restart_container',
-  'docker_remove_container', 'docker_container_logs', 'docker_container_exec', 'docker_init_worker', 'docker_gateway_chat', 'docker_pull_image', 'docker_pull_status',
+  'docker_remove_container', 'docker_rebuild_container', 'docker_container_logs', 'docker_container_exec', 'docker_init_worker', 'docker_gateway_chat', 'docker_agent', 'docker_agent_broadcast', 'docker_dispatch_task', 'docker_dispatch_broadcast', 'docker_task_status', 'docker_task_list', 'docker_pull_image', 'docker_pull_status',
   'docker_list_images', 'docker_list_nodes', 'docker_add_node', 'docker_remove_node',
   'docker_cluster_overview',
   'instance_list', 'instance_add', 'instance_remove', 'instance_set_active',
@@ -103,24 +88,11 @@ async function invoke(cmd, args = {}) {
     logRequest(cmd, args, duration, false)
     return result
   }
-  // Web 模式：优先调用 Vite 开发 API（真实后端），失败时回退 mock
-  try {
-    const result = await webInvoke(cmd, args)
-    const duration = Date.now() - start
-    logRequest(cmd, args, duration, false)
-    return result
-  } catch (e) {
-    // 写操作不回退 mock，直接报错（避免“假成功”）
-    if (NO_MOCK_CMDS.has(cmd)) {
-      logRequest(cmd, args, Date.now() - start, false)
-      throw e
-    }
-    console.warn(`[api] webInvoke(${cmd}) failed:`, e.message, '→ fallback mock')
-    const result = mockInvoke(cmd, args)
-    const duration = Date.now() - start
-    logRequest(cmd, args, duration, false)
-    return result
-  }
+  // Web 模式：调用 dev-api 后端（真实数据）
+  const result = await webInvoke(cmd, args)
+  const duration = Date.now() - start
+  logRequest(cmd, args, duration, false)
+  return result
 }
 
 // Web 模式：通过 Vite 开发服务器的 API 端点调用真实后端
@@ -142,162 +114,36 @@ async function webInvoke(cmd, args) {
   return resp.json()
 }
 
-// Mock 数据，方便纯浏览器开发调试
-function mockInvoke(cmd, args) {
-  const mocks = {
-    get_services_status: () => [
-      { label: 'ai.openclaw.gateway', pid: null, running: false, description: 'OpenClaw Gateway', cli_installed: true },
-    ],
-    get_version_info: () => ({
-      current: '2026.2.23',
-      latest: null,
-      update_available: false,
-    }),
-    read_openclaw_config: () => ({
-      meta: { lastTouchedVersion: '2026.2.23' },
-      models: {
-        mode: 'replace',
-        providers: {
-          'newapi-claude': {
-            baseUrl: 'http://localhost:30080/v1',
-            api: 'openai-completions',
-            models: [
-              { id: 'claude-opus-4-6' },
-              { id: 'claude-sonnet-4-5' },
-            ],
-          },
-        },
-      },
-      agents: {
-        defaults: {
-          model: { primary: 'newapi-claude/claude-opus-4-6', fallbacks: ['newapi-claude/claude-sonnet-4-5'] },
-          maxConcurrent: 4,
-          subagents: 2,
-        },
-      },
-      gateway: { port: 18789, mode: 'local', bind: 'loopback', authToken: '' },
-    }),
-    write_openclaw_config: () => true,
-    read_log_tail: ({ logName }) => {
-      const logs = {
-        'gateway': [
-          '2026-02-26 13:29:01 [INFO] Gateway started on :18789',
-          '2026-02-26 13:29:02 [INFO] Agent connected: claude-opus-4-6',
-          '2026-02-26 13:29:05 [INFO] Request /v1/chat/completions → 200 (1.2s)',
-          '2026-02-26 13:30:12 [INFO] Request /v1/chat/completions → 200 (3.8s)',
-          '2026-02-26 13:31:00 [WARN] Rate limit approaching: 45/50 rpm',
-          '2026-02-26 13:32:15 [INFO] Request /v1/chat/completions → 200 (2.1s)',
-        ],
-        'gateway-err': ['2026-02-26 12:00:01 [ERROR] Upstream 502: connection refused'],
-        'guardian': ['2026-02-26 13:29:00 [INFO] Health check passed', '2026-02-26 13:30:00 [INFO] Health check passed'],
-        'guardian-backup': ['2026-02-26 12:00:00 [INFO] Backup completed: openclaw.json.bak'],
-        'config-audit': ['{"ts":"2026-02-26T13:29:00Z","action":"config.read","file":"openclaw.json"}'],
-      }
-      return (logs[logName] || logs['gateway']).join('\n')
-    },
-    search_log: ({ query }) => [
-      `2026-02-26 13:29:01 [INFO] Match: ${query}`,
-      `2026-02-26 13:30:12 [INFO] Found: ${query} in request`,
-    ],
-    list_memory_files: ({ category }) => {
-      const files = {
-        memory: ['active-context.md', 'decisions.md', 'progress.md'],
-        archive: ['2026-02-sprint1.md', '2026-02-sprint2.md'],
-        core: ['AGENTS.md', 'CLAUDE.md'],
-      }
-      return files[category] || files.memory
-    },
-    read_memory_file: ({ path }) => `# ${path}\n\n这是 ${path} 的内容示例。\n\n## 概述\n\n在此记录工作记忆...`,
-    write_memory_file: () => true,
-    delete_memory_file: () => true,
-    export_memory_zip: ({ category }) => `/tmp/openclaw-${category}-20260226-160000.zip`,
-    check_installation: () => ({ installed: true, path: '/usr/local/bin/openclaw', version: '2026.2.23', inDocker: false }),
-    get_deploy_mode: () => ({ inDocker: false, dockerAvailable: true, mode: 'local' }),
-    docker_cluster_overview: () => [
-      { id: 'local', name: '本机', type: 'socket', endpoint: '/var/run/docker.sock', online: true, dockerVersion: '27.4.1', os: 'Docker Desktop', cpus: 8, memory: 16 * 1024 * 1024 * 1024, totalContainers: 3, runningContainers: 2, stoppedContainers: 1, containers: [
-        { id: 'a1b2c3d4e5f6', name: 'openclaw', image: 'ghcr.io/qingchencloud/openclaw:latest', state: 'running', status: 'Up 2 hours', ports: '1420→1420, 18789→18789' },
-        { id: 'f6e5d4c3b2a1', name: 'openclaw-gw-2', image: 'ghcr.io/qingchencloud/openclaw:latest-gateway', state: 'running', status: 'Up 5 hours', ports: '18790→18789' },
-        { id: 'b3c4d5e6f7a8', name: 'openclaw-test', image: 'ghcr.io/qingchencloud/openclaw:latest', state: 'exited', status: 'Exited (0) 1 day ago', ports: '' },
-      ]},
-    ],
-    docker_list_containers: () => [
-      { id: 'a1b2c3d4e5f6', name: 'openclaw', image: 'ghcr.io/qingchencloud/openclaw:latest', state: 'running', status: 'Up 2 hours', ports: '1420→1420, 18789→18789', nodeId: 'local', nodeName: '本机' },
-    ],
-    docker_info: () => ({ nodeId: 'local', nodeName: '本机', containers: 3, containersRunning: 2, containersStopped: 1, images: 5, serverVersion: '27.4.1', os: 'Docker Desktop', arch: 'x86_64', cpus: 8, memory: 16 * 1024 * 1024 * 1024 }),
-    docker_list_nodes: () => [{ id: 'local', name: '本机', type: 'socket', endpoint: '/var/run/docker.sock' }],
-    docker_container_logs: () => '[INFO] OpenClaw Gateway started\n[INFO] Listening on :18789\n[INFO] Panel available at :1420',
-    docker_list_images: () => [{ id: 'sha256abcdef', tags: ['ghcr.io/qingchencloud/openclaw:latest'], size: 450 * 1024 * 1024, created: Date.now() / 1000 - 86400 }],
-    instance_list: () => ({ activeId: 'local', instances: [{ id: 'local', name: '本机', type: 'local', endpoint: null, gatewayPort: 18789, addedAt: 0, note: '' }] }),
-    instance_add: () => ({ id: 'remote-mock', name: 'mock' }),
-    instance_remove: () => true,
-    instance_set_active: () => ({ activeId: 'local' }),
-    instance_health_check: () => ({ id: 'local', online: true, version: '2026.3.5', gatewayRunning: true, lastCheck: Date.now() }),
-    instance_health_all: () => [{ id: 'local', online: true, version: '2026.3.5', gatewayRunning: true, lastCheck: Date.now() }],
-    check_node: () => ({ installed: true, version: 'v20.11.0' }),
-    get_deploy_config: () => ({ gatewayUrl: 'http://127.0.0.1:18789', authToken: '', version: '2026.2.23' }),
-    read_mcp_config: () => ({
-      mcpServers: {
-        'exa': { command: 'npx', args: ['-y', '@anthropic/exa-mcp-server'], env: { EXA_API_KEY: '***' } },
-        'web-reader': { command: 'npx', args: ['-y', '@anthropic/web-reader-mcp'], env: {} },
-        'pal': { command: 'node', args: ['/opt/pal-mcp/index.js'], env: {} },
-      },
-    }),
-    write_mcp_config: () => true,
-    start_service: () => true,
-    stop_service: () => true,
-    restart_service: () => true,
-    reload_gateway: () => 'Gateway 已重载',
-    restart_gateway: () => 'Gateway 已重启',
-    list_agents: () => [
-      { id: 'main', isDefault: true, identityName: null, model: null, workspace: null },
-    ],
-    upgrade_openclaw: () => '升级成功，当前版本: 2026.2.26-zh.3 (mock)',
-    install_gateway: () => 'Gateway 服务已安装 (mock)',
-    uninstall_gateway: () => 'Gateway 服务已卸载 (mock)',
-    get_npm_registry: () => 'https://registry.npmmirror.com',
-    set_npm_registry: () => true,
-    test_model: ({ modelId }) => `模型 ${modelId} 连通正常 (mock)`,
-    list_remote_models: () => ['gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo', 'gpt-3.5-turbo', 'o3-mini', 'dall-e-3', 'text-embedding-3-small'],
-    patch_model_vision: () => false,
-    check_panel_update: () => ({ latest: '0.2.0', url: 'https://github.com/qingchencloud/clawpanel/releases' }),
-    write_env_file: () => true,
-    list_backups: () => [
-      { name: 'openclaw-20260226-143000.json', size: 8542, created_at: 1740577800 },
-      { name: 'openclaw-20260225-100000.json', size: 8210, created_at: 1740474000 },
-    ],
-    create_backup: () => ({ name: 'openclaw-20260226-160000.json', size: 8542 }),
-    restore_backup: () => true,
-    delete_backup: () => true,
-    get_cftunnel_status: () => ({
-      installed: true, version: 'cftunnel 0.7.0', running: true,
-      tunnel_name: 'mac-home', pid: 73325,
-      routes: [
-        { name: 'webapp', domain: 'app.example.com', service: 'http://localhost:3210' },
-        { name: 'api', domain: 'api.example.com', service: 'http://localhost:30080' },
-        { name: 'webhook', domain: 'hook.example.com', service: 'http://localhost:9801' },
-      ],
-    }),
-    cftunnel_action: () => true,
-    get_cftunnel_logs: () => '2026-02-26 13:29:01 [INFO] Tunnel started\n2026-02-26 13:30:00 [INFO] Connection healthy',
-    get_clawapp_status: () => ({ running: true, pid: 7752, port: 3210, url: 'http://localhost:3210' }),
-    // AI 助手工具
-    assistant_exec: ({ command }) => `[mock] 执行: ${command}\n这是模拟输出`,
-    assistant_read_file: ({ path }) => `[mock] 文件内容: ${path}\n# 示例文件\n这是模拟文件内容`,
-    assistant_write_file: ({ path, content }) => `已写入 ${path} (${content.length} 字节)`,
-    assistant_list_dir: ({ path }) => '[DIR]  src/\n[DIR]  docs/\n[FILE] README.md (1024 bytes)\n[FILE] package.json (512 bytes)',
-    assistant_system_info: () => `OS: ${navigator.platform.includes('Win') ? 'windows' : navigator.platform.includes('Mac') ? 'macos' : 'linux'}\nArch: x86_64\nHome: ${navigator.platform.includes('Win') ? 'C:\\Users\\user' : '/Users/user'}\nHostname: mock-host\nShell: ${navigator.platform.includes('Win') ? 'powershell / cmd' : 'zsh'}\nPath separator: ${navigator.platform.includes('Win') ? '\\\\' : '/'}`,
-    assistant_list_processes: ({ filter }) => filter ? `Id ProcessName\n-- -----------\n1234 ${filter}\n5678 ${filter}-helper` : 'Id ProcessName\n-- -----------\n1 System\n1234 node\n5678 openclaw',
-    assistant_check_port: ({ port }) => port === 18789 ? `端口 ${port} 已被占用（正在监听）\n占用进程: node` : `端口 ${port} 未被占用（空闲）`,
-    assistant_web_search: ({ query }) => `搜索「${query}」找到 3 条结果：\n\n1. **${query} - 文档**\n   https://example.com/docs\n   这是关于 ${query} 的文档页面\n\n2. **${query} 常见问题**\n   https://example.com/faq\n   常见问题解答\n\n3. **${query} GitHub**\n   https://github.com/example\n   开源仓库`,
-    assistant_fetch_url: ({ url }) => `# ${url}\n\n这是从 ${url} 抓取的网页内容（mock）。\n\n## 主要内容\n\n示例文本...`,
-    // 数据目录 & 图片存储
-    assistant_ensure_data_dir: () => (navigator.platform.includes('Win') ? 'C:\\Users\\user\\.openclaw\\clawpanel' : '/Users/user/.openclaw/clawpanel'),
-    assistant_save_image: ({ id }) => `/mock/images/${id}.jpg`,
-    assistant_load_image: () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVQI12NgAAIABQABNjN9GQAAAAlwSFlzAAAWJQAAFiUBSVIk8AAAAA0lEQVQI12P4z8BQDwAEgAF/QualzQAAAABJRU5ErkJggg==',
-    assistant_delete_image: () => null,
+// 后端连接状态
+let _backendOnline = null // null=未检测, true=在线, false=离线
+const _backendListeners = []
+
+export function onBackendStatusChange(fn) {
+  _backendListeners.push(fn)
+  return () => { const i = _backendListeners.indexOf(fn); if (i >= 0) _backendListeners.splice(i, 1) }
+}
+
+export function isBackendOnline() { return _backendOnline }
+
+function _setBackendOnline(v) {
+  if (_backendOnline !== v) {
+    _backendOnline = v
+    _backendListeners.forEach(fn => { try { fn(v) } catch {} })
   }
-  const fn = mocks[cmd]
-  return fn ? Promise.resolve(fn(args)) : Promise.reject(`未知命令: ${cmd}`)
+}
+
+// 后端健康检查
+export async function checkBackendHealth() {
+  if (isTauri) { _setBackendOnline(true); return true }
+  try {
+    const resp = await fetch('/__api/health', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    const ok = resp.ok
+    _setBackendOnline(ok)
+    return ok
+  } catch {
+    _setBackendOnline(false)
+    return false
+  }
 }
 
 // 导出 API
@@ -307,6 +153,7 @@ export const api = {
   startService: (label) => { invalidate('get_services_status'); return invoke('start_service', { label }) },
   stopService: (label) => { invalidate('get_services_status'); return invoke('stop_service', { label }) },
   restartService: (label) => { invalidate('get_services_status'); return invoke('restart_service', { label }) },
+  guardianStatus: () => invoke('guardian_status'),
 
   // 配置（读缓存，写清缓存）
   getVersionInfo: () => cachedInvoke('get_version_info', {}, 30000),
@@ -367,14 +214,6 @@ export const api = {
   restoreBackup: (name) => invoke('restore_backup', { name }),
   deleteBackup: (name) => { invalidate('list_backups'); return invoke('delete_backup', { name }) },
 
-  // 扩展工具
-  getCftunnelStatus: () => cachedInvoke('get_cftunnel_status', {}, 10000),
-  cftunnelAction: (action) => { invalidate('get_cftunnel_status'); return invoke('cftunnel_action', { action }) },
-  getCftunnelLogs: (lines = 20) => cachedInvoke('get_cftunnel_logs', { lines }, 5000),
-  getClawappStatus: () => cachedInvoke('get_clawapp_status', {}, 5000),
-  installCftunnel: () => invoke('install_cftunnel'),
-  installClawapp: () => invoke('install_clawapp'),
-
   // 设备密钥 + Gateway 握手
   createConnectFrame: (nonce, gatewayToken) => invoke('create_connect_frame', { nonce, gatewayToken }),
 
@@ -423,7 +262,14 @@ export const api = {
   dockerContainerLogs: (nodeId, containerId, tail = 200) => invoke('docker_container_logs', { nodeId, containerId, tail }),
   dockerContainerExec: (nodeId, containerId, cmd) => invoke('docker_container_exec', { nodeId, containerId, cmd }),
   dockerInitWorker: (nodeId, containerId, role) => invoke('docker_init_worker', { nodeId, containerId, role }),
-  dockerGatewayChat: (nodeId, containerId, message) => invoke('docker_gateway_chat', { nodeId, containerId, message }),
+  dockerGatewayChat: (nodeId, containerId, message, timeout = DOCKER_TASK_TIMEOUT_MS) => invoke('docker_gateway_chat', { nodeId, containerId, message, timeout }),
+  dockerAgent: (nodeId, containerId, cmd) => invoke('docker_agent', { nodeId, containerId, cmd }),
+  dockerAgentBroadcast: (nodeId, containerIds, message, timeout = DOCKER_TASK_TIMEOUT_MS) => invoke('docker_agent_broadcast', { nodeId, containerIds, message, timeout }),
+  dockerDispatchTask: (nodeId, containerId, containerName, message, timeout = DOCKER_TASK_TIMEOUT_MS) => invoke('docker_dispatch_task', { nodeId, containerId, containerName, message, timeout }),
+  dockerDispatchBroadcast: (nodeId, targets, message, timeout = DOCKER_TASK_TIMEOUT_MS) => invoke('docker_dispatch_broadcast', { nodeId, targets, message, timeout }),
+  dockerTaskStatus: (taskId) => invoke('docker_task_status', { taskId }),
+  dockerTaskList: (containerId, status) => invoke('docker_task_list', { containerId, status }),
+  dockerRebuildContainer: (nodeId, containerId, pullLatest = true) => invoke('docker_rebuild_container', { nodeId, containerId, pullLatest }),
   dockerPullImage: (nodeId, image, tag, requestId) => invoke('docker_pull_image', { nodeId, image, tag, requestId }),
   dockerPullStatus: (requestId) => invoke('docker_pull_status', { requestId }),
   dockerListImages: (nodeId) => invoke('docker_list_images', { nodeId }),
