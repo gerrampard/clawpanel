@@ -36,7 +36,23 @@ pub async fn list_agents() -> Result<Value, String> {
                 .to_string()
         });
 
-    let enriched: Vec<Value> = agents_list
+    // main agent 是隐式的（不在 agents.list 中），始终插入
+    let has_main = agents_list
+        .iter()
+        .any(|a| a.get("id").and_then(|v| v.as_str()) == Some("main"));
+    let all_agents = if has_main {
+        agents_list
+    } else {
+        let mut v = vec![serde_json::json!({
+            "id": "main",
+            "isDefault": true,
+            "workspace": default_workspace.clone(),
+        })];
+        v.extend(agents_list);
+        v
+    };
+
+    let enriched: Vec<Value> = all_agents
         .into_iter()
         .map(|mut agent| {
             let id = agent
